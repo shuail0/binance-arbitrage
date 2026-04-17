@@ -1,0 +1,30 @@
+# 即时刷量策略配置（币安现货）
+#
+# 策略逻辑:
+# - 以卖一价挂 FOK 买单，成交后立即按买一价挂 FOK 卖单
+# - 一买一卖完成后计入一轮成交
+#
+# 统计口径说明:
+# - quantity: 每轮买入数量，单位为基础币
+# - maxVolume: 停止条件为 (买入成交额 + 卖出成交额) >= 2 * maxVolume
+#   即单边目标成交额
+
+strategy_id: "IV_001"
+
+# 现货交易对
+symbol: "XAUTUSDT"
+
+# 每轮买入数量（基础币）
+quantity: "0.3"
+
+# 最大允许价差（USDT），超过则跳过本轮
+maxSpread: "0.01"
+
+# 下单间隔（秒）
+orderInterval: 1
+
+# 单边目标成交额（USDT），双边达到 2 * maxVolume 后停止
+maxVolume: 100000
+
+# 单次订单等待成交超时（秒）
+orderTimeout: 30
