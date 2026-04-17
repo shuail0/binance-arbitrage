@@ -1,0 +1,37 @@
+# 环境变量
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# 虚拟环境
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 日志
+logs/
+*.log
+
+# 状态文件
+volume_state.json
+*_state_*.json
+
+# 密钥
+*.pem
+keys/
