@@ -1,0 +1,54 @@
+# 币安合约做市/刷量策略配置
+apiKey: ""
+privateKeyPath: ""
+strategyId: "SV_001"
+symbol: "BTCUSDT"
+leverage: 5
+marginType: "CROSSED"
+demo: false
+
+strategy:
+  stepSize: "1.0"
+  startLevel: 0
+  numOrdersEachSide: 5
+  quantity: "0.001"
+  maximumLong: 0.01
+  maximumShort: 0.01
+  maxVolume: 0
+  autoCloseOnExit: true
+  orderInterval: 1
+  sizeGrowthFactor: 0
+
+  # 买卖比信号
+  imbalanceDepth: 5
+  imbalanceThreshold: 1.5
+  imbalanceLevelScale: 0.6
+  imbalanceMode: "quantity"
+
+  # 改单容差
+  priceTolerance: 0
+
+  # 波动率熔断
+  volEnabled: true
+  volPauseMultiplier: 3
+  volResumeMultiplier: 1.3
+  volMaxRangePct: 0
+  volSafeRangePct: 0
+  volCloseOnPause: true
+  volDirectionAware: true
+  volPositionThreshold: 0.3
+
+  # 成交活跃度熔断
+  activityWindow: 0
+  activityMinTrades: 0
+  activityResumeTrades: 0
+  activityMinCoverage: 0
+  activityCloseOnPause: true
+
+  # BNB 手续费管理
+  bnbMinBalance: 0
+  bnbBuyAmount: 0.2
+  bnbExitBalance: 0
+
+  # GTX 模式
+  postOnly: false
