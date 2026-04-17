@@ -1,0 +1,97 @@
+# 策略唯一标识，用于日志文件名和状态文件区分
+strategy_id: "SPOT_V2_001"
+
+# 交易对（币安格式，如 XAUTUSDT、BTCUSDT）
+symbol: "XAUTUSDT"
+
+# 每笔买单的基础下单数量（单位：基础币）
+# 必须符合交易对的 stepSize 精度
+quantity: 0.3
+
+# === 止盈止损 ===
+
+# 止盈价格偏移（绝对值，单位 USDT）
+# 买入成交后，卖单挂在 买入价 + take_profit_offset
+# 设为 0 时卖单直接挂在买入价（刷量模式）
+take_profit_offset: 0.01
+
+# 止损价格偏移（绝对值，单位 USDT）
+# 当市场价跌至 买入价 - stop_loss_offset 时触发市价止损
+stop_loss_offset: 0.02
+
+# 止盈单超时时间（秒）
+# 买单成交后若超过该时间止盈单仍未成交，则取消止盈单并市价平仓
+# 如果止盈单价格仍在卖一价，会自动重置超时计时
+take_profit_timeout: 60
+
+# 止损检查频率（秒），monitor_positions 循环间隔
+stop_loss_check_interval: 1.0
+
+# === 买单网格 ===
+
+# 每档买单之间的绝对价差（单位 USDT）
+# 例如 step=0.01 时，5档买单价格为: bid, bid-0.01, bid-0.02, bid-0.03, bid-0.04
+step: 0.01
+
+# 起始档位偏移
+# 0 = 第一档紧贴买一价（bid - step*0）
+# 1 = 跳过最内侧一档，从 bid - step*1 开始
+start_level: 0
+
+# 买盘同时挂几档买单
+num_levels: 5
+
+# 每档数量递增因子
+# 0 = 所有档位数量相同
+# >0 时第 i 档数量 = quantity * (1 + size_growth_factor * i)
+size_growth_factor: 0
+
+# 最大净买入量上限（单位：基础币）
+# 当已成交未卖出的持仓总量接近此值时，按比例减少买单档数
+# 达到上限时完全停止买入，0 = 不限制
+max_net_buy: 10
+
+# === 节奏控制 ===
+
+# 网格刷新间隔（秒）
+# 每隔该时间重新计算目标网格，取消偏离档位并补下新档位
+order_interval: 1.0
+
+# 最大活跃持仓数（OPENING + OPEN + CLOSING 总和）
+# 超过此数量时不再下新买单
+max_order_groups: 10
+
+# 累计成交额上限（买入额 + 卖出额，单位 USDT）
+# 达到后自动触发退出流程，0 = 不限制
+max_volume: 100000
+
+# === 波动率熔断 ===
+
+# 熔断总开关: false=关闭熔断（支持热加载，运行中修改即生效）
+vol_enabled: true
+
+# 安全振幅阈值（振幅/价格 的比例）
+# 当实际振幅低于此值时，跳过相对倍数检查，避免小波动误触发熔断
+vol_safe_range_pct: 0.0001
+
+# 绝对振幅上限（振幅/价格 的比例）
+# 超过此值直接触发熔断，0 = 不限制（仅用相对倍数判断）
+vol_max_range_pct: 0
+
+# 相对波动率熔断倍数
+# 当前振幅 / 基准振幅（历史中位数）> 此值时触发熔断
+vol_pause_multiplier: 3.0
+
+# 熔断恢复倍数（低于触发倍数，形成迟滞防止反复触发）
+# 当前振幅 / 基准振幅 <= 此值 且绝对振幅也安全时恢复运行
+vol_resume_multiplier: 1.5
+
+# 熔断触发后是否市价清仓
+# true = 撤单 + 市价卖出所有持仓
+# false = 仅撤单暂停，不清仓
+vol_close_on_pause: true
+
+# === 退出行为 ===
+
+# 程序退出时（Ctrl+C / SIGINT）是否自动市价卖出剩余持仓
+auto_close_on_exit: true
