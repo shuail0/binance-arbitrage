@@ -641,7 +641,7 @@ class SwapVolume:
             batch = ops[i:i+5]
             batch_orders = [
                 ModifyMultipleOrdersBatchOrdersParameterInner(
-                    symbol=self.symbol, order_id=op.order_id, side=op.side,
+                    symbol=self.symbol, order_id=str(op.order_id), side=op.side,
                     price=str(op.new_price), quantity=str(op.new_qty),
                 )
                 for op in batch
