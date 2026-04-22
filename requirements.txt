@@ -1,8 +1,16 @@
-websockets>=12.0
-aiohttp>=3.9.0
-cryptography>=42.0.0
+# 官方 SDK (模块化版, 自动处理签名/重连/listenKey)
+binance-sdk-spot>=8.2.0
+binance-sdk-derivatives-trading-usds-futures>=10.0.0
+
+# 基础运行时 (SDK 依赖的 websockets / aiohttp / pydantic 会自动装)
 python-dotenv>=1.0.0
 loguru>=0.7.0
-orjson>=3.9.10
 pyyaml>=6.0
-openpyxl>=3.1.0
+
+# 非 SDK 场景用的库
+cryptography>=42.0.0    # 兼容: liquidate.py 独立签名场景 (后续可移除)
+orjson>=3.9.10          # 快速 JSON 解析 (部分策略日志/状态持久化)
+openpyxl>=3.1.0         # tools/strategy_manager.py 读 Excel
+
+# SOCKS 代理支持 (中国大陆开发环境需要)
+python-socks[asyncio]>=2.4.0
