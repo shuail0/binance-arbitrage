@@ -402,11 +402,21 @@ class SwapVolume:
     def _on_user_data(self, event):
         try:
             from binance_sdk_derivatives_trading_usds_futures.websocket_streams.models import OrderTradeUpdate
-            actual = getattr(event, "actual_instance", event)
-            if isinstance(actual, OrderTradeUpdate):
+            # actual_instance 为 None 时回退到 event 本身
+            actual = getattr(event, "actual_instance", None)
+            if actual is None:
+                actual = event
+            logger.debug(f"UserData 事件: SDK类型={type(actual).__name__}")
+            if isinstance(actual, OrderTradeUpdate) or type(actual).__name__ == "OrderTradeUpdate":
                 self._handle_order_update(actual)
+            else:
+                # dict 或未识别模型: 记录事件类型辅助诊断
+                e_type = (actual.get("e") if isinstance(actual, dict)
+                          else getattr(actual, "e", ""))
+                if e_type:
+                    logger.info(f"UserData 未处理事件: e={e_type} type={type(actual).__name__}")
         except Exception as e:
-            logger.error(f"处理 UserData 回调失败: {e}")
+            logger.error(f"处理 UserData 回调失败: {e}", exc_info=True)
 
     async def _init_ws_streams(self):
         sym = self.symbol.lower()
@@ -431,31 +441,45 @@ class SwapVolume:
 
     # ─── ORDER_TRADE_UPDATE 处理 ─────────────────────────────────────────────
 
+    @staticmethod
+    def _g(o, *keys, default=""):
+        """按优先级尝试多个字段名, 兼容 SDK 单字母字段和 snake_case 字段"""
+        for k in keys:
+            v = getattr(o, k, None)
+            if v is not None and v != "":
+                return v
+        return default
+
     def _handle_order_update(self, msg):
         """处理 ORDER_TRADE_UPDATE (SDK Pydantic OrderTradeUpdate)"""
         try:
             o = getattr(msg, "o", None)
             if o is None:
+                logger.warning(f"ORDER_TRADE_UPDATE: o 字段为 None, msg类型={type(msg).__name__}")
                 return
-            symbol = getattr(o, "s", "") or ""
+            symbol = self._g(o, "s", "symbol") or ""
             if symbol != self.symbol:
                 return
-            cl_ord_id = getattr(o, "c", "") or ""
-            order_id = getattr(o, "i", 0) or 0
-            status = getattr(o, "X", "") or ""
-            side = getattr(o, "S", "") or ""
+            cl_ord_id = self._g(o, "c", "client_order_id", "new_client_order_id") or ""
+            order_id = self._g(o, "i", "order_id", default=0) or 0
+            # X=当前订单状态, x=执行类型(不同字段), order_status 是 SDK snake_case 名
+            status = self._g(o, "X", "order_status", "status") or ""
+            side = self._g(o, "S", "side") or ""
             order_key = str(order_id)
             pending_key = f"p:{cl_ord_id}"
 
+            logger.debug(f"ORDER_TRADE_UPDATE | {side} {status} orderId={order_id} clOrdId={cl_ord_id[-8:] if cl_ord_id else ''}")
+
             if status == "NEW":
                 self.active_orders.pop(pending_key, None)
-                price = Decimal(str(getattr(o, "p", "0") or "0"))
-                qty = Decimal(str(getattr(o, "q", "0") or "0"))
+                price = Decimal(str(self._g(o, "p", "price", "original_price") or "0"))
+                qty = Decimal(str(self._g(o, "q", "original_quantity", "orig_qty") or "0"))
                 self.active_orders[order_key] = ActiveOrder(
                     cl_ord_id=cl_ord_id, order_id=order_id,
                     side=side, price=price, quantity=qty)
 
             elif status in ("PARTIALLY_FILLED", "FILLED"):
+                logger.info(f"成交 | {side} orderId={order_id} status={status}")
                 self._update_position(o)
                 if status == "FILLED":
                     self.active_orders.pop(order_key, None)
@@ -469,16 +493,18 @@ class SwapVolume:
             logger.error(f"处理 ORDER_TRADE_UPDATE 失败: {e}", exc_info=True)
 
     def _update_position(self, o):
-        """o 是 OrderTradeUpdateO Pydantic 模型 (单字母字段)"""
-        last_qty = Decimal(str(getattr(o, "l", "0") or "0"))
-        last_px = Decimal(str(getattr(o, "L", "0") or "0"))
+        """o 是 OrderTradeUpdateO Pydantic 模型, 兼容单字母字段和 snake_case"""
+        last_qty = Decimal(str(self._g(o, "l", "last_filled_qty", "last_qty", "last_executed_qty") or "0"))
+        last_px = Decimal(str(self._g(o, "L", "last_filled_price", "last_price", "last_executed_price") or "0"))
         if last_qty.is_zero() or last_px.is_zero():
+            logger.warning(f"_update_position: last_qty={last_qty} last_px={last_px} 无法统计, 检查字段映射")
+            logger.warning(f"  o 字段: {[k for k in vars(o).keys() if not k.startswith('_')][:20] if hasattr(o, '__dict__') else type(o).__name__}")
             return
 
         volume = last_qty * last_px
-        realized_pnl = Decimal(str(getattr(o, "rp", "0") or "0"))
-        side = getattr(o, "S", "") or ""
-        status = getattr(o, "X", "") or ""
+        realized_pnl = Decimal(str(self._g(o, "rp", "realized_profit", "realized_pnl") or "0"))
+        side = self._g(o, "S", "side") or ""
+        status = self._g(o, "X", "order_status", "status") or ""
 
         if side == "BUY":
             self.position_amt += last_qty
