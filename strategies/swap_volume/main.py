@@ -642,7 +642,7 @@ class SwapVolume:
             batch_orders = [
                 ModifyMultipleOrdersBatchOrdersParameterInner(
                     symbol=self.symbol, order_id=op.order_id, side=op.side,
-                    price=float(op.new_price), quantity=float(op.new_qty),
+                    price=str(op.new_price), quantity=str(op.new_qty),
                 )
                 for op in batch
             ]
@@ -697,8 +697,8 @@ class SwapVolume:
             batch_orders = [
                 PlaceMultipleOrdersBatchOrdersParameterInner(
                     symbol=self.symbol, side=t.side, type="LIMIT",
-                    time_in_force=tif, price=float(t.price),
-                    quantity=float(t.quantity), new_client_order_id=cid,
+                    time_in_force=tif, price=str(t.price),
+                    quantity=str(t.quantity), new_client_order_id=cid,
                 )
                 for t, cid in zip(batch, cl_ord_ids)
             ]
@@ -941,7 +941,7 @@ class SwapVolume:
             resp = await asyncio.to_thread(
                 self.futures_client.rest_api.new_order,
                 symbol=self.symbol, side=side, type="MARKET",
-                quantity=float(qty), new_client_order_id=cid)
+                quantity=str(qty), new_client_order_id=cid)
             data = resp.data()
             order_id = getattr(data, "order_id", None)
             avg_price = getattr(data, "avg_price", "?")
@@ -991,7 +991,7 @@ class SwapVolume:
         try:
             await asyncio.to_thread(
                 self.spot_client.rest_api.new_order,
-                symbol="BNBUSDT", side="BUY", type="MARKET", quantity=float(buy_amt))
+                symbol="BNBUSDT", side="BUY", type="MARKET", quantity=str(buy_amt))
             logger.info("[BNB] 现货买入成功")
             logger.warning("[BNB] 注意: 请在 Binance 账户设置开启「自动划转手续费」，"
                            "或手动将 BNB 从现货划转至合约账户")
