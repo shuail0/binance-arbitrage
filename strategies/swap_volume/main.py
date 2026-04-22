@@ -10,7 +10,6 @@ import os
 import signal
 import sys
 import time
-from base64 import b64encode
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -18,13 +17,10 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Optional
 
-import aiohttp
-import websockets
 import yaml
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
-from dotenv import load_dotenv
 from loguru import logger
+
+from strategies.common import load_credentials, make_futures_client, make_spot_client
 
 
 # ─── 数据结构 ────────────────────────────────────────────────────────────────────
@@ -94,7 +90,6 @@ class VolatilityTracker:
         return self.baseline > 0
 
     def get_state(self) -> tuple[float, float, float, bool]:
-        """返回 (range_pct, ratio, direction, ready)"""
         direction = (self._prices[-1] - self._prices[0]) if len(self._prices) >= 2 else 0
         return self.range_pct, self.ratio, direction, self.ready
 
@@ -118,7 +113,6 @@ class ActivityTracker:
             self._trade_times.pop(0)
 
     def trade_stats(self) -> tuple[float, float, float]:
-        """返回 (min_trades, max_trades, min_coverage) 最近N个自然分钟"""
         cur_min = int(time.time() // 60) * 60_000
         counts = [0] * self.window_min
         bits = [0] * self.window_min
@@ -193,26 +187,11 @@ class SwapVolume:
         self.cfg = cfg
         self.symbol: str = cfg["symbol"]
         self.strategy_id: str = cfg.get("strategyId", "SV_001")
-        self.api_key: str = cfg["apiKey"]
-        self.demo: bool = cfg.get("demo", False)
         self.should_stop = False
 
-        # 私钥
-        pk_path = cfg["privateKeyPath"]
-        if not pk_path or not os.path.exists(pk_path):
-            raise FileNotFoundError(f"私钥文件不存在: {pk_path}")
-        self._private_key: Ed25519PrivateKey = load_pem_private_key(
-            Path(pk_path).read_bytes(), password=None)
-
-        # URL
-        if self.demo:
-            self.rest_base = "https://demo-fapi.binance.com"
-            self.ws_stream_url = "wss://fstream.binancefuture.com/stream"
-            self.spot_rest_base = "https://demo-api.binance.com"
-        else:
-            self.rest_base = "https://fapi.binance.com"
-            self.ws_stream_url = "wss://fstream.binance.com/stream"
-            self.spot_rest_base = "https://api.binance.com"
+        creds = load_credentials()
+        self.futures_client = make_futures_client(creds, with_ws_streams=True)
+        self.spot_client = make_spot_client(creds, with_ws_api=False, with_ws_streams=False)
 
         # 市场数据
         self.bid_price = self.ask_price = Decimal("0")
@@ -246,9 +225,6 @@ class SwapVolume:
         # User Data Stream
         self.listen_key: Optional[str] = None
 
-        # HTTP session (持久化, 复用 TCP+TLS; 合约和现货 BNB 共用)
-        self._http_session: Optional[aiohttp.ClientSession] = None
-
         # 控制
         self._order_seq = 0
         self._last_reconcile = 0.0
@@ -258,17 +234,6 @@ class SwapVolume:
         self._config_path = Path(__file__).parent / "config.yaml"
         self._current_leverage = 0
         self.strategy_tasks: list = []
-
-    # ─── 签名 ────────────────────────────────────────────────────────────────
-
-    def _sign(self, payload: str) -> str:
-        return b64encode(self._private_key.sign(payload.encode())).decode()
-
-    def _sign_params(self, params: dict) -> dict:
-        params["timestamp"] = str(int(time.time() * 1000))
-        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-        params["signature"] = self._sign(query)
-        return params
 
     # ─── 工具函数 ─────────────────────────────────────────────────────────────
 
@@ -332,36 +297,6 @@ class SwapVolume:
         if not s.get("bnbBuyAmount") or s["bnbBuyAmount"] <= 0:
             s["bnbBuyAmount"] = 0.2
 
-    # ─── REST (合约) ─────────────────────────────────────────────────────────
-
-    async def _get_http_session(self) -> aiohttp.ClientSession:
-        """懒加载持久 HTTP session, 复用 TCP+TLS 连接"""
-        if self._http_session is None or self._http_session.closed:
-            self._http_session = aiohttp.ClientSession()
-        return self._http_session
-
-    async def _futures_rest(self, method: str, path: str, params: dict = None,
-                            signed: bool = True) -> dict | list:
-        url = f"{self.rest_base}{path}"
-        headers = {"X-MBX-APIKEY": self.api_key}
-        params = dict(params or {})
-        if signed:
-            params = self._sign_params(params)
-        session = await self._get_http_session()
-        async with session.request(method, url, params=params, headers=headers) as resp:
-            return await resp.json()
-
-    async def _spot_rest(self, method: str, path: str, params: dict = None,
-                         signed: bool = True) -> dict | list:
-        url = f"{self.spot_rest_base}{path}"
-        headers = {"X-MBX-APIKEY": self.api_key}
-        params = dict(params or {})
-        if signed:
-            params = self._sign_params(params)
-        session = await self._get_http_session()
-        async with session.request(method, url, params=params, headers=headers) as resp:
-            return await resp.json()
-
     # ─── 初始化 ──────────────────────────────────────────────────────────────
 
     async def initialize(self):
@@ -370,16 +305,20 @@ class SwapVolume:
         self.act_tracker = ActivityTracker(self.s.get("activityWindow", 3) or 3)
 
         # 交易规则
-        data = await self._futures_rest("GET", "/fapi/v1/exchangeInfo", signed=False)
-        sym = next((s for s in data.get("symbols", []) if s["symbol"] == self.symbol), None)
+        resp = await asyncio.to_thread(self.futures_client.rest_api.exchange_information)
+        data = resp.data()
+        sym = next((s for s in data.symbols if s.symbol == self.symbol), None)
         if not sym:
             raise RuntimeError(f"交易对 {self.symbol} 不存在")
-        for f in sym.get("filters", []):
-            if f["filterType"] == "PRICE_FILTER":
-                self.tick_size = Decimal(f["tickSize"])
-            elif f["filterType"] == "LOT_SIZE":
-                self.step_size = Decimal(f["stepSize"])
-                self.min_qty = Decimal(f.get("minQty", "0.001"))
+        for f in sym.filters:
+            ft = getattr(f, "filter_type", None) or getattr(f, "filterType", None)
+            if ft == "PRICE_FILTER":
+                self.tick_size = Decimal(str(f.tick_size))
+            elif ft == "LOT_SIZE":
+                self.step_size = Decimal(str(f.step_size))
+                mq = getattr(f, "min_qty", None) or getattr(f, "minQty", None)
+                if mq:
+                    self.min_qty = Decimal(str(mq))
         logger.info(f"交易规则 | {self.symbol} | tick={self.tick_size} step={self.step_size} minQty={self.min_qty}")
 
         # 设置持仓模式 + 保证金 + 杠杆
@@ -393,129 +332,122 @@ class SwapVolume:
         self._init_trade_csv()
 
     async def _setup_account(self):
-        # 单向持仓
         try:
-            await self._futures_rest("POST", "/fapi/v1/positionSide/dual", {"dualSidePosition": "false"})
+            await asyncio.to_thread(self.futures_client.rest_api.change_position_mode, dual_side_position="false")
         except Exception:
             pass
 
-        # 保证金类型
         margin_type = self.cfg.get("marginType", "CROSSED")
         try:
-            await self._futures_rest("POST", "/fapi/v1/marginType",
-                                     {"symbol": self.symbol, "marginType": margin_type})
+            await asyncio.to_thread(self.futures_client.rest_api.change_margin_type,
+                                    symbol=self.symbol, margin_type=margin_type)
         except Exception:
             pass
 
-        # 杠杆
         leverage = self.cfg.get("leverage", 5) or 5
         try:
-            result = await self._futures_rest("POST", "/fapi/v1/leverage",
-                                              {"symbol": self.symbol, "leverage": str(leverage)})
+            resp = await asyncio.to_thread(self.futures_client.rest_api.change_initial_leverage,
+                                           symbol=self.symbol, leverage=int(leverage))
+            data = resp.data()
             self._current_leverage = leverage
-            logger.info(f"杠杆={leverage}x | maxNotional={result.get('maxNotionalValue', '?')}")
+            logger.info(f"杠杆={leverage}x | maxNotional={data.max_notional_value}")
         except Exception as e:
             logger.warning(f"设置杠杆失败: {e}")
 
-    # ─── Listen Key ──────────────────────────────────────────────────────────
-
-    async def _get_listen_key(self) -> str:
-        # USER_STREAM 类型接口: 仅需 API Key header, 不需要签名
-        data = await self._futures_rest("POST", "/fapi/v1/listenKey", signed=False)
-        return data["listenKey"]
+    # ─── listenKey keepalive ─────────────────────────────────────────────────
 
     async def _keepalive_listen_key_loop(self):
         while not self.should_stop:
             try:
                 await asyncio.sleep(30 * 60)
                 if self.listen_key:
-                    await self._futures_rest("PUT", "/fapi/v1/listenKey", signed=False)
+                    await asyncio.to_thread(self.futures_client.rest_api.keepalive_user_data_stream)
                     logger.debug("listenKey keepalive 完成")
             except Exception as e:
                 logger.warning(f"listenKey keepalive 失败: {e}")
 
-    # ─── WS Streams ──────────────────────────────────────────────────────────
+    # ─── WS Streams (SDK) ───────────────────────────────────────────────────
 
-    async def _run_market_streams(self):
-        """depth + aggTrade"""
+    def _on_depth(self, msg):
+        try:
+            b = getattr(msg, "b", None) or (msg.get("b") if isinstance(msg, dict) else None)
+            a = getattr(msg, "a", None) or (msg.get("a") if isinstance(msg, dict) else None)
+            if b is not None:
+                self.depth_bids = [item.root if hasattr(item, "root") else item for item in b]
+                if self.depth_bids:
+                    self.bid_price = Decimal(str(self.depth_bids[0][0]))
+            if a is not None:
+                self.depth_asks = [item.root if hasattr(item, "root") else item for item in a]
+                if self.depth_asks:
+                    self.ask_price = Decimal(str(self.depth_asks[0][0]))
+        except Exception as e:
+            logger.debug(f"解析 depth 失败: {e}")
+
+    def _on_agg_trade(self, msg):
+        try:
+            p = getattr(msg, "p", None) or (msg.get("p") if isinstance(msg, dict) else None)
+            T = getattr(msg, "T", None) or (msg.get("T") if isinstance(msg, dict) else None)
+            if p:
+                price = float(p)
+                if price > 0:
+                    self.vol_tracker.on_price(price)
+            if T and self.act_tracker:
+                self.act_tracker.on_trade(int(T))
+        except Exception as e:
+            logger.debug(f"解析 aggTrade 失败: {e}")
+
+    def _on_user_data(self, event):
+        try:
+            from binance_sdk_derivatives_trading_usds_futures.websocket_streams.models import OrderTradeUpdate
+            actual = getattr(event, "actual_instance", event)
+            if isinstance(actual, OrderTradeUpdate):
+                self._handle_order_update(actual)
+        except Exception as e:
+            logger.error(f"处理 UserData 回调失败: {e}")
+
+    async def _init_ws_streams(self):
         sym = self.symbol.lower()
-        depth_levels = 5
         imb_depth = self.s.get("imbalanceDepth", 5)
-        if imb_depth > 5:
-            depth_levels = 10
-        if imb_depth > 10:
-            depth_levels = 20
-        streams = f"{sym}@depth{depth_levels}@500ms/{sym}@aggTrade"
-        url = f"{self.ws_stream_url}?streams={streams}"
-        while not self.should_stop:
-            try:
-                async with websockets.connect(url, ping_interval=20) as ws:
-                    logger.info(f"WS Streams 已连接 | depth{depth_levels} + aggTrade")
-                    async for raw in ws:
-                        if self.should_stop:
-                            break
-                        msg = json.loads(raw)
-                        data = msg.get("data", msg)
-                        stream = msg.get("stream", "")
-                        if "depth" in stream:
-                            self.depth_bids = data.get("b", data.get("bids", []))
-                            self.depth_asks = data.get("a", data.get("asks", []))
-                            if self.depth_bids:
-                                self.bid_price = Decimal(self.depth_bids[0][0])
-                            if self.depth_asks:
-                                self.ask_price = Decimal(self.depth_asks[0][0])
-                        elif "aggTrade" in stream:
-                            price = float(data.get("p", 0))
-                            if price > 0:
-                                self.vol_tracker.on_price(price)
-                            trade_time = data.get("T", 0)
-                            if trade_time and self.act_tracker:
-                                self.act_tracker.on_trade(trade_time)
-            except (websockets.ConnectionClosed, Exception) as e:
-                if self.should_stop:
-                    break
-                logger.warning(f"WS Streams 断线: {e}，3秒后重连...")
-                await asyncio.sleep(3)
+        depth_levels = 5 if imb_depth <= 5 else (10 if imb_depth <= 10 else 20)
 
-    async def _run_user_data_stream(self):
-        while not self.should_stop:
-            try:
-                self.listen_key = await self._get_listen_key()
-                url = f"{self.ws_stream_url.replace('/stream', '')}/ws/{self.listen_key}"
-                async with websockets.connect(url, ping_interval=20) as ws:
-                    logger.info("User Data Stream 已连接")
-                    async for raw in ws:
-                        if self.should_stop:
-                            break
-                        msg = json.loads(raw)
-                        if msg.get("e") == "ORDER_TRADE_UPDATE":
-                            self._handle_order_update(msg)
-            except (websockets.ConnectionClosed, Exception) as e:
-                if self.should_stop:
-                    break
-                logger.warning(f"User Data Stream 断线: {e}，3秒后重连...")
-                await asyncio.sleep(3)
+        await self.futures_client.websocket_streams.create_connection()
+        h1 = await self.futures_client.websocket_streams.partial_book_depth_streams(
+            symbol=sym, levels=depth_levels, update_speed="500ms")
+        h1.on("message", self._on_depth)
+        h2 = await self.futures_client.websocket_streams.aggregate_trade_streams(symbol=sym)
+        h2.on("message", self._on_agg_trade)
+        logger.info(f"WS Streams 已订阅 | depth{depth_levels} + aggTrade")
+
+    async def _init_user_data_stream(self):
+        resp = await asyncio.to_thread(self.futures_client.rest_api.start_user_data_stream)
+        data = resp.data()
+        self.listen_key = data.listen_key
+        h = await self.futures_client.websocket_streams.user_data(listenKey=self.listen_key)
+        h.on("message", self._on_user_data)
+        logger.info("User Data Stream 已订阅")
 
     # ─── ORDER_TRADE_UPDATE 处理 ─────────────────────────────────────────────
 
-    def _handle_order_update(self, msg: dict):
+    def _handle_order_update(self, msg):
+        """处理 ORDER_TRADE_UPDATE (SDK Pydantic OrderTradeUpdate)"""
         try:
-            o = msg.get("o", {})
-            symbol = o.get("s", "")
+            o = getattr(msg, "o", None)
+            if o is None:
+                return
+            symbol = getattr(o, "s", "") or ""
             if symbol != self.symbol:
                 return
-            cl_ord_id = o.get("c", "")
-            order_id = o.get("i", 0)
-            status = o.get("X", "")       # NEW / PARTIALLY_FILLED / FILLED / CANCELED / EXPIRED
-            side = o.get("S", "")
+            cl_ord_id = getattr(o, "c", "") or ""
+            order_id = getattr(o, "i", 0) or 0
+            status = getattr(o, "X", "") or ""
+            side = getattr(o, "S", "") or ""
             order_key = str(order_id)
             pending_key = f"p:{cl_ord_id}"
 
             if status == "NEW":
-                # pending -> active
                 self.active_orders.pop(pending_key, None)
-                price = Decimal(o.get("p", "0"))
-                qty = Decimal(o.get("q", "0"))
+                price = Decimal(str(getattr(o, "p", "0") or "0"))
+                qty = Decimal(str(getattr(o, "q", "0") or "0"))
                 self.active_orders[order_key] = ActiveOrder(
                     cl_ord_id=cl_ord_id, order_id=order_id,
                     side=side, price=price, quantity=qty)
@@ -533,15 +465,17 @@ class SwapVolume:
         except Exception as e:
             logger.error(f"处理 ORDER_TRADE_UPDATE 失败: {e}", exc_info=True)
 
-    def _update_position(self, o: dict):
-        last_qty = Decimal(o.get("l", "0"))
-        last_px = Decimal(o.get("L", "0"))
+    def _update_position(self, o):
+        """o 是 OrderTradeUpdateO Pydantic 模型 (单字母字段)"""
+        last_qty = Decimal(str(getattr(o, "l", "0") or "0"))
+        last_px = Decimal(str(getattr(o, "L", "0") or "0"))
         if last_qty.is_zero() or last_px.is_zero():
             return
 
         volume = last_qty * last_px
-        realized_pnl = Decimal(o.get("rp", "0"))
-        side = o.get("S", "")
+        realized_pnl = Decimal(str(getattr(o, "rp", "0") or "0"))
+        side = getattr(o, "S", "") or ""
+        status = getattr(o, "X", "") or ""
 
         if side == "BUY":
             self.position_amt += last_qty
@@ -551,7 +485,7 @@ class SwapVolume:
             self.stats.add_sell(volume, realized_pnl)
 
         self._save_state()
-        self._write_trade_csv(side, o.get("X", ""), last_px, last_qty, volume, realized_pnl)
+        self._write_trade_csv(side, status, last_px, last_qty, volume, realized_pnl)
 
     # ─── 网格计算 + 库存偏斜 ────────────────────────────────────────────────
 
@@ -566,10 +500,8 @@ class SwapVolume:
         buy_levels = sell_levels = n
         pos = float(self.position_amt)
 
-        # 多头 -> 减少买层
         if (ml := self._max_long()) > 0 and pos > 0:
             buy_levels = math.ceil(n * max(1 - pos / ml, 0))
-        # 空头 -> 减少卖层
         if (ms := self._max_short()) > 0 and pos < 0:
             sell_levels = math.ceil(n * max(1 + pos / ms, 0))
 
@@ -588,12 +520,10 @@ class SwapVolume:
         growth = Decimal(str(self.s.get("sizeGrowthFactor", 0)))
         start_level = int(self.s.get("startLevel", 0))
 
-        # 步长
         step_abs = self._align_price(Decimal(str(self.s.get("stepSize", "1.0"))))
         if step_abs < self.tick_size:
             step_abs = self.tick_size
 
-        # OBI 偏斜
         imbalance = self._calc_imbalance(int(self.s.get("imbalanceDepth", 5)))
         threshold = float(self.s.get("imbalanceThreshold", 1.5))
         scale = float(self.s.get("imbalanceLevelScale", 0.6))
@@ -631,7 +561,6 @@ class SwapVolume:
 
     def _diff_side(self, active: list[ActiveOrder], targets: list[TargetOrder],
                    price_tolerance: Decimal) -> tuple[list[int], list[ReplaceOp], list[TargetOrder]]:
-        """返回 (to_cancel_ids, to_replace, to_place)"""
         used_active = set()
         used_target = set()
 
@@ -646,7 +575,6 @@ class SwapVolume:
                     if ao.quantity != t.quantity:
                         used_active.discard(j)
                         used_target.discard(i)
-                        # 改单
                     else:
                         break
                     break
@@ -677,47 +605,61 @@ class SwapVolume:
 
         return to_cancel, to_replace, to_place
 
-    # ─── 批量执行 (REST) ────────────────────────────────────────────────────
+    # ─── 批量执行 (REST SDK) ────────────────────────────────────────────────
 
     async def _execute_batch_cancels(self, order_ids: list[int]):
         if not order_ids:
             return
-        # 立即移除
         for oid in order_ids:
             self.active_orders.pop(str(oid), None)
-        # 每批最多10单
         for i in range(0, len(order_ids), 10):
             batch = order_ids[i:i+10]
             try:
-                params = {"symbol": self.symbol, "orderIdList": json.dumps(batch)}
-                results = await self._futures_rest("DELETE", "/fapi/v1/batchOrders", params)
+                resp = await asyncio.to_thread(
+                    self.futures_client.rest_api.cancel_multiple_orders,
+                    symbol=self.symbol, order_id_list=batch)
+                results = resp.data()
                 if isinstance(results, list):
                     for r in results:
-                        if isinstance(r, dict) and r.get("code") and "Unknown order" not in str(r.get("msg", "")):
-                            logger.warning(f"撤单失败: {r.get('msg')}")
+                        extra = getattr(r, "additional_properties", {}) or {}
+                        code = extra.get("code", 0) or 0
+                        msg = extra.get("msg", "") or ""
+                        if code and int(code) < 0 and "Unknown order" not in msg:
+                            logger.warning(f"撤单失败: {msg}")
             except Exception as e:
                 logger.warning(f"批量撤单请求失败: {e}")
 
     async def _execute_batch_modifies(self, ops: list[ReplaceOp]):
         if not ops:
             return
-        # 每批最多5单
+        from binance_sdk_derivatives_trading_usds_futures.rest_api.models import (
+            ModifyMultipleOrdersBatchOrdersParameterInner,
+        )
         for i in range(0, len(ops), 5):
             batch = ops[i:i+5]
-            items = [{"symbol": self.symbol, "orderId": op.order_id, "side": op.side,
-                       "price": str(op.new_price), "quantity": str(op.new_qty)} for op in batch]
+            batch_orders = [
+                ModifyMultipleOrdersBatchOrdersParameterInner(
+                    symbol=self.symbol, order_id=op.order_id, side=op.side,
+                    price=float(op.new_price), quantity=float(op.new_qty),
+                )
+                for op in batch
+            ]
             try:
-                params = {"batchOrders": json.dumps(items)}
-                results = await self._futures_rest("PUT", "/fapi/v1/batchOrders", params)
+                resp = await asyncio.to_thread(
+                    self.futures_client.rest_api.modify_multiple_orders,
+                    batch_orders=batch_orders)
+                results = resp.data()
                 if isinstance(results, list):
                     for j, r in enumerate(results):
-                        if isinstance(r, dict) and r.get("code"):
-                            msg = r.get("msg", "")
+                        extra = getattr(r, "additional_properties", {}) or {}
+                        code = extra.get("code", 0) or 0
+                        msg = extra.get("msg", "") or ""
+                        if code and int(code) < 0:
                             if "does not exist" in msg:
                                 self.active_orders.pop(str(batch[j].order_id), None)
                             elif "No need to modify" not in msg:
                                 logger.warning(f"改单跳过(orderID={batch[j].order_id}): {msg}")
-                        elif isinstance(r, dict) and r.get("orderId"):
+                        elif getattr(r, "order_id", None):
                             key = str(batch[j].order_id)
                             if key in self.active_orders:
                                 self.active_orders[key].price = batch[j].new_price
@@ -728,43 +670,37 @@ class SwapVolume:
     async def _execute_batch_places(self, targets: list[TargetOrder]):
         if not targets:
             return
-
+        from binance_sdk_derivatives_trading_usds_futures.rest_api.models import (
+            PlaceMultipleOrdersBatchOrdersParameterInner,
+        )
         post_only = self.s.get("postOnly", False)
         tif = "GTX" if post_only else "GTC"
         gtx_rejects = 0
 
-        # GTX 价格保护
         if post_only:
-            filtered = []
-            for t in targets:
-                if t.side == "SELL" and t.price <= self.bid_price:
-                    continue
-                if t.side == "BUY" and t.price >= self.ask_price:
-                    continue
-                filtered.append(t)
+            filtered = [t for t in targets
+                        if not (t.side == "SELL" and t.price <= self.bid_price)
+                        and not (t.side == "BUY" and t.price >= self.ask_price)]
             targets = filtered
             if not targets:
                 return
 
-        # 每批最多5单
         for i in range(0, len(targets), 5):
             if tif == "GTX" and gtx_rejects >= 3:
                 tif = "GTC"
                 logger.warning(f"GTX 被拒 {gtx_rejects} 次，本轮降级 GTC")
 
             batch = targets[i:i+5]
-            items = []
-            cl_ord_ids = []
-            for t in batch:
-                cid = self._new_cid()
-                cl_ord_ids.append(cid)
-                items.append({
-                    "symbol": self.symbol, "side": t.side, "type": "LIMIT",
-                    "timeInForce": tif, "price": str(t.price),
-                    "quantity": str(t.quantity), "newClientOrderId": cid,
-                })
+            cl_ord_ids = [self._new_cid() for _ in batch]
+            batch_orders = [
+                PlaceMultipleOrdersBatchOrdersParameterInner(
+                    symbol=self.symbol, side=t.side, type="LIMIT",
+                    time_in_force=tif, price=float(t.price),
+                    quantity=float(t.quantity), new_client_order_id=cid,
+                )
+                for t, cid in zip(batch, cl_ord_ids)
+            ]
 
-            # 预注册 pending
             for j, cid in enumerate(cl_ord_ids):
                 self.active_orders[f"p:{cid}"] = ActiveOrder(
                     cl_ord_id=cid, side=batch[j].side,
@@ -772,19 +708,26 @@ class SwapVolume:
                     pending=True, sent_at=time.time())
 
             try:
-                params = {"batchOrders": json.dumps(items)}
-                results = await self._futures_rest("POST", "/fapi/v1/batchOrders", params)
+                resp = await asyncio.to_thread(
+                    self.futures_client.rest_api.place_multiple_orders,
+                    batch_orders=batch_orders)
+                results = resp.data()
                 if isinstance(results, list):
                     for j, r in enumerate(results):
                         cid = cl_ord_ids[j]
-                        if isinstance(r, dict) and r.get("code"):
-                            msg = r.get("msg", "")
-                            if "Post Only" in msg:
+                        extra = getattr(r, "additional_properties", {}) or {}
+                        code = extra.get("code", 0) or 0
+                        msg = extra.get("msg", "") or ""
+                        oid = getattr(r, "order_id", None)
+                        if code and int(code) < 0:
+                            if "Post Only" in msg or "would immediately" in msg:
                                 gtx_rejects += 1
-                            elif "would immediately" not in msg:
+                            elif msg:
                                 logger.warning(f"下单失败: {msg}")
                             self.active_orders.pop(f"p:{cid}", None)
-                        # 成功的不需要处理, ORDER_TRADE_UPDATE 会 pending -> active
+                        elif not oid:
+                            self.active_orders.pop(f"p:{cid}", None)
+                        # 成功: ORDER_TRADE_UPDATE 会 pending -> active
             except Exception as e:
                 logger.warning(f"批量下单请求失败: {e}")
                 for cid in cl_ord_ids:
@@ -796,7 +739,6 @@ class SwapVolume:
         if self.bid_price <= 0 or self.ask_price <= 0:
             return
 
-        # 定期校准
         now = time.time()
         if now - self._last_reconcile >= 5:
             asyncio.ensure_future(self._reconcile_orders())
@@ -804,7 +746,6 @@ class SwapVolume:
 
         target_buys, target_sells = self._calculate_target_orders(self.bid_price, self.ask_price)
 
-        # 清理超时 pending
         stale = [k for k, ao in self.active_orders.items()
                  if ao.pending and time.time() - ao.sent_at > 5]
         for k in stale:
@@ -821,7 +762,6 @@ class SwapVolume:
         all_replaces = buy_replace + sell_replace
         all_places = buy_place + sell_place
 
-        # 先撤 -> 再改 -> 后下
         if all_cancels or all_replaces or all_places:
             asyncio.ensure_future(self._execute_cycle(all_cancels, all_replaces, all_places))
 
@@ -833,7 +773,6 @@ class SwapVolume:
     # ─── 波动率熔断 (方向感知) ───────────────────────────────────────────────
 
     def _check_volatility(self):
-        """返回 True 表示应跳过下单"""
         if not self.s.get("volEnabled", True):
             if self._vol_paused:
                 self._vol_paused = False
@@ -849,7 +788,6 @@ class SwapVolume:
         abs_ok = max_range <= 0 or range_pct <= max_range
         rel_ok = abs_safe or not vol_ready or ratio <= mult
 
-        # 触发熔断
         if not self._vol_paused and not (abs_ok and rel_ok):
             should_trigger = True
 
@@ -873,7 +811,6 @@ class SwapVolume:
                 else:
                     logger.warning(f"波动率熔断: rangePct={range_pct:.6f} ratio={ratio:.1f}x, 撤单等待")
 
-        # 解除熔断
         if self._vol_paused and abs_ok and rel_ok:
             self._vol_paused = False
             asyncio.ensure_future(self._cancel_all_orders())
@@ -885,7 +822,6 @@ class SwapVolume:
     # ─── 活跃度熔断 ──────────────────────────────────────────────────────────
 
     def _check_activity(self):
-        """返回 True 表示应跳过下单"""
         min_t = float(self.s.get("activityMinTrades", 0))
         if min_t <= 0 or not self.act_tracker or not self.act_tracker.ready:
             return self._act_paused
@@ -917,13 +853,15 @@ class SwapVolume:
 
     async def _sync_position(self):
         try:
-            positions = await self._futures_rest("GET", "/fapi/v2/positionRisk",
-                                                 {"symbol": self.symbol})
+            resp = await asyncio.to_thread(
+                self.futures_client.rest_api.position_information_v2, symbol=self.symbol)
+            positions = resp.data()
             if isinstance(positions, list):
                 for p in positions:
-                    if p.get("symbol") == self.symbol and p.get("positionSide", "BOTH") in ("BOTH", ""):
-                        self.position_amt = Decimal(p.get("positionAmt", "0"))
-                        self.entry_price = Decimal(p.get("entryPrice", "0"))
+                    ps = getattr(p, "position_side", "BOTH") or "BOTH"
+                    if getattr(p, "symbol", "") == self.symbol and ps in ("BOTH", ""):
+                        self.position_amt = Decimal(str(getattr(p, "position_amt", "0") or "0"))
+                        self.entry_price = Decimal(str(getattr(p, "entry_price", "0") or "0"))
                         logger.info(f"持仓同步 | 持仓={self.position_amt} | 入场价={self.entry_price}")
                         break
         except Exception as e:
@@ -931,7 +869,9 @@ class SwapVolume:
 
     async def _reconcile_orders(self):
         try:
-            orders = await self._futures_rest("GET", "/fapi/v1/openOrders", {"symbol": self.symbol})
+            resp = await asyncio.to_thread(
+                self.futures_client.rest_api.current_all_open_orders, symbol=self.symbol)
+            orders = resp.data()
             if not isinstance(orders, list):
                 return
 
@@ -940,14 +880,14 @@ class SwapVolume:
             real_orders: dict[str, ActiveOrder] = {}
             rest_buys = rest_sells = 0
             for o in orders:
-                cid = o.get("clientOrderId", "")
+                cid = getattr(o, "client_order_id", "") or ""
                 if not cid.startswith("fmm_"):
                     continue
-                oid = o["orderId"]
+                oid = getattr(o, "order_id", 0)
                 key = str(oid)
-                price = Decimal(o["price"])
-                qty = Decimal(o["origQty"])
-                side = o["side"]
+                price = Decimal(str(getattr(o, "price", "0") or "0"))
+                qty = Decimal(str(getattr(o, "orig_qty", "0") or "0"))
+                side = getattr(o, "side", "") or ""
                 if side == "BUY":
                     rest_buys += 1
                 else:
@@ -958,7 +898,6 @@ class SwapVolume:
             old_buys = sum(1 for ao in self.active_orders.values() if ao.side == "BUY" and not ao.pending)
             old_sells = sum(1 for ao in self.active_orders.values() if ao.side == "SELL" and not ao.pending)
 
-            # 保留未超时 pending
             for k, ao in self.active_orders.items():
                 if ao.pending and time.time() - ao.sent_at < 5:
                     real_orders[k] = ao
@@ -972,7 +911,8 @@ class SwapVolume:
 
     async def _cancel_all_orders(self):
         try:
-            await self._futures_rest("DELETE", "/fapi/v1/allOpenOrders", {"symbol": self.symbol})
+            await asyncio.to_thread(
+                self.futures_client.rest_api.cancel_all_open_orders, symbol=self.symbol)
             logger.info("批量撤单完成")
         except Exception as e:
             if "Unknown order" not in str(e):
@@ -988,7 +928,6 @@ class SwapVolume:
             logger.info("无持仓需清理")
             return
 
-        # 最小名义检查
         if self.bid_price > 0 and qty * self.bid_price < 5:
             logger.warning(f"持仓过小(notional={qty * self.bid_price:.2f} < 5), 跳过平仓")
             return
@@ -997,14 +936,17 @@ class SwapVolume:
         cid = f"fmm_close_{int(time.time()*1000)}"
         logger.info(f"市价平仓 | {side} {qty}")
         try:
-            result = await self._futures_rest("POST", "/fapi/v1/order", {
-                "symbol": self.symbol, "side": side, "type": "MARKET",
-                "quantity": str(qty), "newClientOrderId": cid,
-            })
-            if result.get("orderId"):
-                logger.info(f"平仓成功 | orderId={result['orderId']} avgPrice={result.get('avgPrice', '?')}")
+            resp = await asyncio.to_thread(
+                self.futures_client.rest_api.new_order,
+                symbol=self.symbol, side=side, type="MARKET",
+                quantity=float(qty), new_client_order_id=cid)
+            data = resp.data()
+            order_id = getattr(data, "order_id", None)
+            avg_price = getattr(data, "avg_price", "?")
+            if order_id:
+                logger.info(f"平仓成功 | orderId={order_id} avgPrice={avg_price}")
             else:
-                logger.warning(f"平仓响应: {result}")
+                logger.warning(f"平仓响应异常: {data}")
         except Exception as e:
             logger.error(f"平仓失败: {e} | 请手动平仓 {side} {qty}")
 
@@ -1023,19 +965,18 @@ class SwapVolume:
         if min_bal <= 0:
             return
 
-        # 查合约 BNB 余额
-        balances = await self._futures_rest("GET", "/fapi/v2/balance")
+        resp = await asyncio.to_thread(self.futures_client.rest_api.futures_account_balance_v2)
+        balances = resp.data()
         bnb_balance = Decimal("0")
         if isinstance(balances, list):
             for b in balances:
-                if b.get("asset") == "BNB":
-                    bnb_balance = Decimal(b.get("balance", "0"))
+                if getattr(b, "asset", "") == "BNB":
+                    bnb_balance = Decimal(str(getattr(b, "balance", "0") or "0"))
                     break
 
         if bnb_balance >= Decimal(str(min_bal)):
             return
 
-        # 退出阈值检查
         exit_bal = float(self.s.get("bnbExitBalance", 0))
         if exit_bal > 0 and bnb_balance < Decimal(str(exit_bal)):
             logger.error(f"[BNB] 余额 {bnb_balance} < 退出阈值 {exit_bal}，停止策略")
@@ -1045,24 +986,15 @@ class SwapVolume:
         buy_amt = str(self.s.get("bnbBuyAmount", 0.2))
         logger.info(f"[BNB] 合约余额 {bnb_balance} < {min_bal}，补充 {buy_amt} BNB...")
 
-        # 现货市价买入
         try:
-            await self._spot_rest("POST", "/api/v3/order", {
-                "symbol": "BNBUSDT", "side": "BUY", "type": "MARKET", "quantity": buy_amt,
-            })
-            logger.info(f"[BNB] 现货买入成功")
+            await asyncio.to_thread(
+                self.spot_client.rest_api.new_order,
+                symbol="BNBUSDT", side="BUY", type="MARKET", quantity=float(buy_amt))
+            logger.info("[BNB] 现货买入成功")
+            logger.warning("[BNB] 注意: 请在 Binance 账户设置开启「自动划转手续费」，"
+                           "或手动将 BNB 从现货划转至合约账户")
         except Exception as e:
             logger.warning(f"[BNB] 现货买入失败: {e}")
-            return
-
-        # 划转到合约
-        try:
-            await self._spot_rest("POST", "/sapi/v1/asset/transfer", {
-                "type": "MAIN_UMFUTURE", "asset": "BNB", "amount": buy_amt,
-            })
-            logger.info(f"[BNB] 划转 {buy_amt} BNB 到合约成功")
-        except Exception as e:
-            logger.warning(f"[BNB] 划转失败: {e}")
 
     # ─── CSV + 状态持久化 ────────────────────────────────────────────────────
 
@@ -1133,7 +1065,6 @@ class SwapVolume:
         bc = sum(1 for ao in self.active_orders.values() if ao.side == "BUY" and not ao.pending)
         sc = sum(1 for ao in self.active_orders.values() if ao.side == "SELL" and not ao.pending)
 
-        # 未实现 PnL
         unrealized = Decimal("0")
         if not self.position_amt.is_zero() and self.bid_price > 0:
             mid = (self.bid_price + self.ask_price) / 2
@@ -1164,7 +1095,6 @@ class SwapVolume:
     # ─── 主循环 ──────────────────────────────────────────────────────────────
 
     async def _strategy_loop(self):
-        # 等待初始深度
         for _ in range(40):
             if self.bid_price > 0:
                 break
@@ -1176,44 +1106,39 @@ class SwapVolume:
                 self._loop_count += 1
                 self._reload_config()
 
-                # 最大成交额
                 max_vol = float(self.s.get("maxVolume", 0))
                 if max_vol > 0 and self.stats.total_volume >= Decimal(str(max_vol)):
                     logger.warning(f"累计成交额 {self.stats.total_volume} >= {max_vol}, 停止")
                     self.should_stop = True
                     break
 
-                # 热更新杠杆
                 lev = self.cfg.get("leverage", 5)
                 if lev > 0 and lev != self._current_leverage:
                     try:
-                        result = await self._futures_rest("POST", "/fapi/v1/leverage",
-                                                          {"symbol": self.symbol, "leverage": str(lev)})
+                        resp = await asyncio.to_thread(
+                            self.futures_client.rest_api.change_initial_leverage,
+                            symbol=self.symbol, leverage=int(lev))
+                        data = resp.data()
                         self._current_leverage = lev
-                        logger.info(f"杠杆热更新 | {lev}x | maxNotional={result.get('maxNotionalValue', '?')}")
+                        logger.info(f"杠杆热更新 | {lev}x | maxNotional={data.max_notional_value}")
                     except Exception as e:
                         logger.warning(f"杠杆热更新失败: {e}")
 
-                # 热更新 interval
                 new_interval = float(self.s.get("orderInterval", 1))
                 if new_interval != interval:
                     interval = new_interval
 
-                # 热更新 activity_window
                 if self.act_tracker and (w := self.s.get("activityWindow", 0)):
                     self.act_tracker.window_min = max(w, 1)
 
-                # 等待 BBO
                 if self.bid_price <= 0 or self.ask_price <= 0:
                     await asyncio.sleep(1)
                     continue
 
-                # 波动率熔断
                 if self._check_volatility():
                     await asyncio.sleep(interval)
                     continue
 
-                # 活跃度熔断
                 if self._check_activity():
                     await asyncio.sleep(interval)
                     continue
@@ -1242,12 +1167,11 @@ class SwapVolume:
             self._load_state()
             self._config_mtime = self._config_path.stat().st_mtime
 
-            # 启动 WS
-            asyncio.create_task(self._run_market_streams())
-            asyncio.create_task(self._run_user_data_stream())
+            await self._init_ws_streams()
+            await self._init_user_data_stream()
             asyncio.create_task(self._keepalive_listen_key_loop())
 
-            logger.info("等待 WS 连接...")
+            logger.info("等待 BBO 数据...")
             for _ in range(30):
                 if self.bid_price > 0:
                     break
@@ -1282,18 +1206,15 @@ class SwapVolume:
     async def shutdown(self):
         logger.info("正在关闭策略...")
 
-        # 撤单
         try:
             await self._cancel_all_orders()
         except Exception as e:
             logger.warning(f"撤单失败: {e}")
         await asyncio.sleep(0.5)
 
-        # 清仓
         if self.s.get("autoCloseOnExit", False):
             await self._close_position()
 
-        # 保存
         self._save_state()
         self.stats.save()
         self._print_stats()
@@ -1301,9 +1222,10 @@ class SwapVolume:
         if self._csv_file:
             self._csv_file.close()
 
-        # 关闭 HTTP session
-        if self._http_session and not self._http_session.closed:
-            await self._http_session.close()
+        try:
+            await self.futures_client.websocket_streams.close()
+        except Exception:
+            pass
 
         logger.info("策略已安全关闭")
 
@@ -1323,44 +1245,17 @@ def setup_logger(symbol: str):
 
 def handle_exception(_loop, context):
     msg = context.get("exception", context["message"])
-    if "ConnectionClosed" in str(msg) or "no close frame" in str(msg):
-        return
     logger.error(f"未捕获的异步异常: {msg}", exc_info=context.get("exception"))
 
 
 async def main():
-    load_dotenv()
     config_path = Path(__file__).parent / "config.yaml"
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
-    # 凭证从 .env 读取 (与现货策略统一)
-    cfg["apiKey"] = os.getenv("BINANCE_API_KEY", "")
-    cfg["privateKeyPath"] = os.getenv("BINANCE_PRIVATE_KEY_PATH", "")
-    cfg["demo"] = os.getenv("BINANCE_DEMO", "0") == "1"
-
-    assert cfg["apiKey"] and cfg["privateKeyPath"], \
-        "请在 .env 配置 BINANCE_API_KEY 和 BINANCE_PRIVATE_KEY_PATH"
-
     symbol = cfg.get("symbol", "BTCUSDT")
-    demo = cfg["demo"]
     setup_logger(symbol)
     asyncio.get_running_loop().set_exception_handler(handle_exception)
-
-    s = cfg.get("strategy", {})
-    mode = "Demo" if demo else "Live"
-    logger.info(
-        f"\n{'='*70}\n"
-        f"币安合约做市/刷量策略 (从 Go futures_market_maker 移植)\n"
-        f"交易对: {symbol} | 模式: {mode} | 杠杆: {cfg.get('leverage', 5)}x | 保证金: {cfg.get('marginType', 'CROSSED')}\n"
-        f"网格: step={s.get('stepSize')} levels={s.get('numOrdersEachSide')} "
-        f"qty={s.get('quantity')} growth={s.get('sizeGrowthFactor')}\n"
-        f"持仓限制: long={s.get('maximumLong')} short={s.get('maximumShort')}\n"
-        f"波动率: pause={s.get('volPauseMultiplier')}x resume={s.get('volResumeMultiplier')}x "
-        f"close={s.get('volCloseOnPause')} dirAware={s.get('volDirectionAware')}\n"
-        f"GTX: {s.get('postOnly', False)}\n"
-        f"{'='*70}"
-    )
 
     sv = SwapVolume(cfg)
 
@@ -1372,6 +1267,20 @@ async def main():
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    s = cfg.get("strategy", {})
+    logger.info(
+        f"\n{'='*70}\n"
+        f"币安合约做市/刷量策略 (从 Go futures_market_maker 移植)\n"
+        f"交易对: {symbol} | 杠杆: {cfg.get('leverage', 5)}x | 保证金: {cfg.get('marginType', 'CROSSED')}\n"
+        f"网格: step={s.get('stepSize')} levels={s.get('numOrdersEachSide')} "
+        f"qty={s.get('quantity')} growth={s.get('sizeGrowthFactor')}\n"
+        f"持仓限制: long={s.get('maximumLong')} short={s.get('maximumShort')}\n"
+        f"波动率: pause={s.get('volPauseMultiplier')}x resume={s.get('volResumeMultiplier')}x "
+        f"close={s.get('volCloseOnPause')} dirAware={s.get('volDirectionAware')}\n"
+        f"GTX: {s.get('postOnly', False)}\n"
+        f"{'='*70}"
+    )
 
     try:
         await sv.run()
