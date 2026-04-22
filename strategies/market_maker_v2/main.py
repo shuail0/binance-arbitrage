@@ -18,6 +18,8 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import yaml
 from loguru import logger
 
