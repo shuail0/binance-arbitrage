@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""币安现货刷量策略V2 - 买侧网格 + 止盈止损 + 波动率熔断
-从 OKX spot_volume_v2 移植，通信架构参考 instant_volume
-"""
+"""币安现货刷量策略V2 - 买侧网格 + 止盈止损 + 波动率熔断 (SDK 版)"""
 import asyncio
 import itertools
 import json
@@ -10,7 +8,6 @@ import os
 import signal
 import sys
 import time
-from base64 import b64encode
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -19,13 +16,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, Optional
 
-import aiohttp
-import websockets
 import yaml
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
-from dotenv import load_dotenv
 from loguru import logger
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from strategies.common import load_credentials, make_spot_client
+from strategies.common.ws_errors import parse_ws_error
 
 
 # ==================== 数据模型 ====================
@@ -95,18 +91,14 @@ class StrategyConfig:
     vol_pause_multiplier: float = 3.0
     vol_resume_multiplier: float = 1.5
     vol_close_on_pause: bool = True
-    # 运行时注入
-    api_key: str = ""
-    private_key_path: str = ""
-    demo: bool = False
 
     @classmethod
     def from_yaml(cls, file_path: str) -> "StrategyConfig":
         with open(file_path) as f:
-            return cls(**{k: v for k, v in yaml.safe_load(f).items() if k in cls.__annotations__})
+            data = yaml.safe_load(f)
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
     def validate(self):
-        assert self.api_key and self.private_key_path, "API凭证不能为空"
         assert self.symbol and self.quantity > 0, "交易对和数量必须有效"
         assert self.stop_loss_offset > 0, "必须设置止损参数"
 
@@ -246,67 +238,36 @@ class SpotVolumeV2:
         self.config = config
         self.config_path = Path(config_path) if config_path else None
         self._last_config_mtime = self.config_path.stat().st_mtime if self.config_path and self.config_path.exists() else 0
-        self._private_key: Optional[Ed25519PrivateKey] = None
-        self._load_private_key()
 
-        # URL
-        if config.demo:
-            self.rest_base = "https://demo-api.binance.com"
-            self.ws_api_url = "wss://demo-ws-api.binance.com:443/ws-api/v3"
-            self.ws_stream_url = "wss://demo-stream.binance.com:9443"
-        else:
-            self.rest_base = "https://api.binance.com"
-            self.ws_api_url = "wss://ws-api.binance.com:443/ws-api/v3"
-            self.ws_stream_url = "wss://stream.binance.com:9443"
+        creds = load_credentials()
+        self.client = make_spot_client(creds)
 
         # 市场数据
         self.bid_price = self.ask_price = Decimal("0")
         self.tick_size = Decimal("0.01")
         self.step_size = Decimal("0.001")
-        self.min_notional = Decimal("5")  # 币安最小名义价值
+        self.min_notional = Decimal("5")
         self.base_asset = ""
 
         # 持仓管理
         self.positions: Dict[str, Position] = {}
         self.positions_lock = asyncio.Lock()
-        self.order_cl_map: Dict[str, str] = {}  # 所有订单ID → buy_cl_ord_id
-        self.order_id_map: Dict[int, str] = {}  # orderId(int) → buy_cl_ord_id
+        self.order_cl_map: Dict[str, str] = {}
+        self.order_id_map: Dict[int, str] = {}
         self.stats = Stats(config.strategy_id, config.symbol)
         self.order_counter = itertools.count(1)
 
-        # WS API
-        self.ws_api: Optional[websockets.WebSocketClientProtocol] = None
-        self.ws_api_responses: dict[str, asyncio.Future] = {}
-        self.ws_api_id_counter = 0
-
-        # HTTP session (持久化, 复用 TCP+TLS)
-        self._http_session: Optional[aiohttp.ClientSession] = None
+        # SDK 连接句柄
+        self.ws_api_conn = None
+        self.ws_streams_conn = None
 
         # 波动率
         self.vol_tracker = VolatilityTracker()
         self._vol_paused = False
 
-        # User Data Stream
-        self.listen_key: Optional[str] = None
-
         # 控制
         self.should_stop = False
         self.strategy_tasks = []
-
-    def _load_private_key(self):
-        pem_path = self.config.private_key_path
-        if not pem_path or not os.path.exists(pem_path):
-            raise FileNotFoundError(f"私钥文件不存在: {pem_path}")
-        self._private_key = load_pem_private_key(Path(pem_path).read_bytes(), password=None)
-
-    def _sign(self, payload: str) -> str:
-        return b64encode(self._private_key.sign(payload.encode())).decode()
-
-    def _sign_params(self, params: dict) -> dict:
-        params["timestamp"] = str(int(time.time() * 1000))
-        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-        params["signature"] = self._sign(query)
-        return params
 
     def _align_price(self, price: Decimal) -> str:
         if self.tick_size <= 0:
@@ -341,255 +302,184 @@ class SpotVolumeV2:
         order_value = self._safe_decimal(size) * estimate_price
         return order_value >= self.min_notional, order_value
 
-    # ==================== REST ====================
-
-    async def _get_http_session(self) -> aiohttp.ClientSession:
-        """懒加载持久 HTTP session, 复用 TCP+TLS 连接"""
-        if self._http_session is None or self._http_session.closed:
-            self._http_session = aiohttp.ClientSession()
-        return self._http_session
-
-    async def _rest_request(self, method: str, path: str, params: dict = None, signed: bool = False) -> dict:
-        url = f"{self.rest_base}{path}"
-        headers = {"X-MBX-APIKEY": self.config.api_key}
-        params = params or {}
-        if signed:
-            params = self._sign_params(params)
-        session = await self._get_http_session()
-        async with session.request(method, url, params=params, headers=headers) as resp:
-            return await resp.json()
+    # ==================== REST (SDK) ====================
 
     async def fetch_exchange_info(self):
-        data = await self._rest_request("GET", "/api/v3/exchangeInfo", {"symbol": self.config.symbol})
-        if not data.get("symbols"):
+        resp = await asyncio.to_thread(self.client.rest_api.exchange_info, symbol=self.config.symbol)
+        data = resp.data()
+        if not data.symbols:
             raise RuntimeError(f"交易对 {self.config.symbol} 未找到")
-        sym = data["symbols"][0]
-        self.base_asset = sym["baseAsset"]
-        for f in sym["filters"]:
-            if f["filterType"] == "PRICE_FILTER":
-                self.tick_size = Decimal(f["tickSize"])
-            elif f["filterType"] == "LOT_SIZE":
-                self.step_size = Decimal(f["stepSize"])
-            elif f["filterType"] == "NOTIONAL":
-                self.min_notional = Decimal(f.get("minNotional", "5"))
+        sym = data.symbols[0]
+        self.base_asset = sym.base_asset
+        for f in sym.filters:
+            ft = getattr(f, "filter_type", None) or getattr(f, "filterType", None)
+            if ft == "PRICE_FILTER":
+                self.tick_size = Decimal(str(f.tick_size))
+            elif ft == "LOT_SIZE":
+                self.step_size = Decimal(str(f.step_size))
+            elif ft == "NOTIONAL":
+                mn = getattr(f, "min_notional", None) or getattr(f, "minNotional", None)
+                if mn:
+                    self.min_notional = Decimal(str(mn))
         logger.info(f"交易规则 | {self.config.symbol} | base={self.base_asset} | "
                     f"tick={self.tick_size} | step={self.step_size} | minNotional={self.min_notional}")
 
     async def rest_get_balance(self, asset: str) -> Decimal:
-        data = await self._rest_request("GET", "/api/v3/account", signed=True)
-        for b in data.get("balances", []):
-            if b["asset"] == asset:
-                return Decimal(b["free"])
+        resp = await asyncio.to_thread(self.client.rest_api.get_account)
+        data = resp.data()
+        for b in data.balances or []:
+            if b.asset == asset:
+                return Decimal(str(b.free))
         return Decimal("0")
 
     async def rest_place_market_sell(self, qty: str) -> dict:
-        return await self._rest_request("POST", "/api/v3/order", {
-            "symbol": self.config.symbol, "side": "SELL", "type": "MARKET", "quantity": qty,
-        }, signed=True)
+        try:
+            resp = await asyncio.to_thread(
+                self.client.rest_api.new_order,
+                symbol=self.config.symbol, side="SELL", type="MARKET", quantity=float(qty),
+            )
+            data = resp.data()
+            order_id = getattr(data, "order_id", None)
+            return {"orderId": order_id, "status": getattr(data, "status", "")}
+        except Exception as e:
+            logger.error(f"市价卖出失败: {e}")
+            return {}
 
     async def rest_cancel_open_orders(self):
-        """REST 取消该交易对所有挂单"""
-        return await self._rest_request("DELETE", "/api/v3/openOrders", {
-            "symbol": self.config.symbol,
-        }, signed=True)
-
-    # ==================== Listen Key ====================
-
-    async def _get_listen_key(self) -> str:
-        data = await self._rest_request("POST", "/api/v3/userDataStream", signed=False)
-        return data["listenKey"]
-
-    async def _keepalive_listen_key(self):
-        if self.listen_key:
-            await self._rest_request("PUT", "/api/v3/userDataStream", {"listenKey": self.listen_key})
-
-    async def _keepalive_listen_key_loop(self):
-        while not self.should_stop:
-            try:
-                await asyncio.sleep(30 * 60)  # 每30分钟
-                await self._keepalive_listen_key()
-                logger.debug("listenKey keepalive 完成")
-            except Exception as e:
-                logger.warning(f"listenKey keepalive 失败: {e}")
-
-    # ==================== WS Streams ====================
-
-    async def _run_market_streams(self):
-        """bookTicker + ticker（波动率数据源）"""
-        sym = self.config.symbol.lower()
-        url = f"{self.ws_stream_url}/stream?streams={sym}@bookTicker/{sym}@ticker"
-        while not self.should_stop:
-            try:
-                async with websockets.connect(url, ping_interval=20) as ws:
-                    logger.info(f"WS Streams 已连接 | bookTicker + ticker")
-                    async for raw in ws:
-                        if self.should_stop:
-                            break
-                        msg = json.loads(raw)
-                        data = msg.get("data", msg)
-                        stream = msg.get("stream", "")
-                        if "bookTicker" in stream:
-                            if "b" in data and "a" in data:
-                                self.bid_price = Decimal(data["b"])
-                                self.ask_price = Decimal(data["a"])
-                        elif "ticker" in stream:
-                            last = float(data.get("c", 0))
-                            if last > 0:
-                                self.vol_tracker.on_price(last)
-            except (websockets.ConnectionClosed, Exception) as e:
-                if self.should_stop:
-                    break
-                logger.warning(f"WS Streams 断线: {e}，3秒后重连...")
-                await asyncio.sleep(3)
-
-    async def _run_user_data_stream(self):
-        """User Data Stream: executionReport 推送"""
-        while not self.should_stop:
-            try:
-                self.listen_key = await self._get_listen_key()
-                url = f"{self.ws_stream_url}/ws/{self.listen_key}"
-                async with websockets.connect(url, ping_interval=20) as ws:
-                    logger.info("User Data Stream 已连接")
-                    async for raw in ws:
-                        if self.should_stop:
-                            break
-                        msg = json.loads(raw)
-                        if msg.get("e") == "executionReport":
-                            asyncio.create_task(self._handle_execution_report(msg))
-            except (websockets.ConnectionClosed, Exception) as e:
-                if self.should_stop:
-                    break
-                logger.warning(f"User Data Stream 断线: {e}，3秒后重连...")
-                await asyncio.sleep(3)
-
-    # ==================== WS API ====================
-
-    async def _run_ws_api(self):
-        while not self.should_stop:
-            try:
-                async with websockets.connect(self.ws_api_url, ping_interval=20, max_size=2**22) as ws:
-                    self.ws_api = ws
-                    logger.info("WS API 已连接")
-                    async for raw in ws:
-                        if self.should_stop:
-                            break
-                        msg = json.loads(raw)
-                        req_id = msg.get("id")
-                        if req_id and req_id in self.ws_api_responses:
-                            fut = self.ws_api_responses.pop(req_id)
-                            if not fut.done():
-                                fut.set_result(msg)
-            except (websockets.ConnectionClosed, Exception) as e:
-                if self.should_stop:
-                    break
-                self.ws_api = None
-                logger.warning(f"WS API 断线: {e}，3秒后重连...")
-                await asyncio.sleep(3)
-
-    async def _ws_api_request(self, method: str, params: dict, timeout: float = 10) -> dict:
-        if not self.ws_api:
-            raise RuntimeError("WS API 未连接")
-        self.ws_api_id_counter += 1
-        req_id = f"req_{self.ws_api_id_counter}"
-        params = self._sign_params(params)
-        payload = {"id": req_id, "method": method, "params": {**params, "apiKey": self.config.api_key}}
-        fut = asyncio.get_running_loop().create_future()
-        self.ws_api_responses[req_id] = fut
-        await self.ws_api.send(json.dumps(payload))
         try:
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
-            self.ws_api_responses.pop(req_id, None)
-            raise
+            await asyncio.to_thread(self.client.rest_api.delete_open_orders, symbol=self.config.symbol)
+        except Exception as e:
+            logger.warning(f"REST 批量撤单失败: {e}")
 
-    # ==================== 订单操作 ====================
+    # ==================== WS API (SDK) ====================
+
+    async def _init_ws_api(self):
+        """建立 WS API 连接并 session_logon"""
+        self.ws_api_conn = await self.client.websocket_api.create_connection()
+        await self.ws_api_conn.session_logon()
+        logger.info("WS API 已连接并认证")
 
     async def ws_place_order(self, side: str, ord_type: str, quantity: str,
                              price: str = None, client_order_id: str = None,
                              time_in_force: str = None) -> dict:
-        """WS API 下单"""
-        params = {
-            "symbol": self.config.symbol,
-            "side": side,
-            "type": ord_type,
-            "quantity": quantity,
-        }
-        if client_order_id:
-            params["newClientOrderId"] = client_order_id
-        if price:
-            params["price"] = price
-        if time_in_force:
-            params["timeInForce"] = time_in_force
-        elif ord_type == "LIMIT":
-            params["timeInForce"] = "GTC"
-        resp = await self._ws_api_request("order.place", params)
-        return resp
+        """WS API 下单，返回 {result: {orderId, status}, error: ...}"""
+        try:
+            tif = time_in_force or ("GTC" if ord_type == "LIMIT" else None)
+            resp = await asyncio.wait_for(
+                self.ws_api_conn.order_place(
+                    symbol=self.config.symbol,
+                    side=side,
+                    type=ord_type,
+                    quantity=float(quantity),
+                    price=float(price) if price else None,
+                    new_client_order_id=client_order_id,
+                    time_in_force=tif,
+                ),
+                timeout=10,
+            )
+            data = resp.data()
+            result = data.result
+            if result is None:
+                return {"error": "no result"}
+            return {"result": {"orderId": result.order_id, "status": result.status}}
+        except asyncio.TimeoutError:
+            return {"error": "timeout"}
+        except Exception as e:
+            err_code, err_msg = parse_ws_error({"error": str(e)})
+            return {"error": {"code": err_code, "msg": err_msg or str(e)}}
 
     async def ws_cancel_order(self, order_id: int = None, client_order_id: str = None) -> dict:
         """WS API 撤单"""
-        params = {"symbol": self.config.symbol}
-        if order_id:
-            params["orderId"] = order_id
-        elif client_order_id:
-            params["origClientOrderId"] = client_order_id
         try:
-            return await self._ws_api_request("order.cancel", params, timeout=5)
+            resp = await asyncio.wait_for(
+                self.ws_api_conn.order_cancel(
+                    symbol=self.config.symbol,
+                    order_id=order_id,
+                    orig_client_order_id=client_order_id,
+                ),
+                timeout=5,
+            )
+            data = resp.data()
+            return {"result": {"orderId": data.result.order_id if data.result else None}}
         except asyncio.TimeoutError:
             logger.warning("撤单超时")
-            return {"status": -1}
+            return {"error": "timeout"}
+        except Exception as e:
+            err_code, err_msg = parse_ws_error({"error": str(e)})
+            return {"error": {"code": err_code, "msg": err_msg or str(e)}}
 
-    # ==================== 持仓管理 ====================
+    # ==================== WS Streams (SDK) ====================
 
-    def _register_order_mapping(self, order_id, buy_cl_ord_id: str):
-        """注册订单映射（调用者需持有锁）"""
-        if isinstance(order_id, int) and order_id > 0:
-            self.order_id_map[order_id] = buy_cl_ord_id
-        elif isinstance(order_id, str) and order_id:
-            self.order_cl_map[order_id] = buy_cl_ord_id
+    def _on_book_ticker(self, msg):
+        """bookTicker 回调 (BookTickerResponse Pydantic 或 dict)"""
+        try:
+            b = getattr(msg, "b", None) or (msg.get("b") if isinstance(msg, dict) else None)
+            a = getattr(msg, "a", None) or (msg.get("a") if isinstance(msg, dict) else None)
+            if b and a:
+                self.bid_price = Decimal(str(b))
+                self.ask_price = Decimal(str(a))
+        except Exception as e:
+            logger.debug(f"解析 bookTicker 失败: {e}")
 
-    def _cleanup_position_maps(self, position: Position):
-        """清理持仓的所有映射（调用者需持有锁）"""
-        for oid in [position.buy_cl_ord_id, position.tp_cl_ord_id,
-                    position.timeout_cl_ord_id, position.emergency_cl_ord_id]:
-            if oid:
-                self.order_cl_map.pop(oid, None)
-        for oid in [position.buy_order_id, position.tp_order_id]:
-            if oid:
-                self.order_id_map.pop(oid, None)
+    def _on_ticker(self, msg):
+        """24hr ticker 回调，用于波动率追踪 (TickerResponse Pydantic 或 dict)"""
+        try:
+            # SDK Pydantic 字段 c = lastPrice, dict 也用 c
+            c = getattr(msg, "c", None) or (msg.get("c") if isinstance(msg, dict) else None)
+            if c:
+                last = float(c)
+                if last > 0:
+                    self.vol_tracker.on_price(last)
+        except Exception as e:
+            logger.debug(f"解析 ticker 失败: {e}")
 
-    def _delete_position(self, position: Position):
-        """删除持仓并清理映射（调用者需持有锁）"""
-        self._cleanup_position_maps(position)
-        self.positions.pop(position.buy_cl_ord_id, None)
+    async def _init_ws_streams(self):
+        """订阅 bookTicker + ticker"""
+        sym = self.config.symbol.lower()
+        await self.client.websocket_streams.create_connection()
+        h1 = await self.client.websocket_streams.book_ticker(symbol=sym)
+        h1.on("message", self._on_book_ticker)
+        h2 = await self.client.websocket_streams.ticker(symbol=sym)
+        h2.on("message", self._on_ticker)
+        self.ws_streams_conn = self.client.websocket_streams
+        logger.info(f"WS Streams 已订阅 | {self.config.symbol}@bookTicker + @ticker")
 
-    async def _find_position(self, cl_ord_id: str, order_id: int) -> Optional[Position]:
-        async with self.positions_lock:
-            buy_cl = self.order_cl_map.get(cl_ord_id) or self.order_id_map.get(order_id)
-            if buy_cl:
-                return self.positions.get(buy_cl)
-            return self.positions.get(cl_ord_id)
+    # ==================== User Data Stream (SDK via WS API) ====================
+
+    def _on_user_data(self, event):
+        """User Data Stream 回调 (UserDataStreamEventsResponse Pydantic)"""
+        try:
+            from binance_sdk_spot.websocket_api.models import ExecutionReport
+            actual = getattr(event, "actual_instance", event)
+            if isinstance(actual, ExecutionReport):
+                asyncio.create_task(self._handle_execution_report(actual))
+        except Exception as e:
+            logger.error(f"处理 UserData 回调失败: {e}")
+
+    async def _init_user_data_stream(self):
+        """通过 WS API session_logon + 签名订阅 User Data Stream"""
+        result = await self.ws_api_conn.user_data_stream_subscribe_signature()
+        result.stream.on("message", self._on_user_data)
+        logger.info("User Data Stream 已订阅 (WS API session)")
 
     # ==================== executionReport 处理 ====================
 
-    async def _handle_execution_report(self, msg: dict):
-        """处理 User Data Stream 的 executionReport"""
+    async def _handle_execution_report(self, msg):
+        """处理 ExecutionReport Pydantic 模型"""
         try:
-            symbol = msg.get("s", "")
+            symbol = getattr(msg, "s", "") or ""
             if symbol != self.config.symbol:
                 return
 
-            cl_ord_id = msg.get("c", "")
-            order_id = msg.get("i", 0)
-            exec_type = msg.get("x", "")       # NEW/TRADE/CANCELED/EXPIRED
-            order_status = msg.get("X", "")     # NEW/PARTIALLY_FILLED/FILLED/CANCELED
-            side = msg.get("S", "")
-            cum_filled_qty = self._safe_decimal(msg.get("z"))  # accFillSz 等价
-            last_filled_price = self._safe_decimal(msg.get("L"))
-            last_filled_qty = self._safe_decimal(msg.get("l"))
-            price = self._safe_decimal(msg.get("p"))
-            commission = self._safe_decimal(msg.get("n"))
-            commission_asset = msg.get("N", "")
-            cum_quote_qty = self._safe_decimal(msg.get("Z"))  # 累计成交额
+            cl_ord_id = getattr(msg, "c", "") or ""
+            order_id = getattr(msg, "i", 0) or 0
+            order_status = getattr(msg, "X", "") or ""
+            cum_filled_qty = self._safe_decimal(getattr(msg, "z", None))
+            last_filled_price = self._safe_decimal(getattr(msg, "L", None))
+            price = self._safe_decimal(getattr(msg, "p", None))
+            commission = self._safe_decimal(getattr(msg, "n", None))
+            commission_asset = getattr(msg, "N", "") or ""
+            cum_quote_qty = self._safe_decimal(getattr(msg, "Z", None))
 
             position = await self._find_position(cl_ord_id, order_id)
 
@@ -604,27 +494,20 @@ class SpotVolumeV2:
             # ========== 买单 ==========
             if cl_ord_id == position.buy_cl_ord_id:
                 if order_status == "FILLED":
-                    # 买单成交 → OPEN → 挂止盈
                     actual_filled = cum_filled_qty
                     if commission_asset == self.base_asset and commission > 0:
                         actual_filled = max(cum_filled_qty - commission, Decimal("0"))
-
-                    # 使用加权均价: cumQuoteQty / cumFilledQty
                     avg_price = cum_quote_qty / cum_filled_qty if cum_filled_qty > 0 else price
                     position.buy_price = self._align_price(avg_price)
                     position.filled_size = self._align_qty(actual_filled)
                     position.buy_order_id = order_id
                     position.open_time = datetime.now()
                     position.status = PositionStatus.OPEN
-
-                    # 重新计算止盈/止损价
                     bp = Decimal(position.buy_price)
                     position.take_profit_price = self._align_price(bp + Decimal(str(self.config.take_profit_offset)))
                     position.stop_loss_price = self._align_price(bp - Decimal(str(self.config.stop_loss_offset)))
-
                     async with self.positions_lock:
                         self._register_order_mapping(order_id, position.buy_cl_ord_id)
-
                     buy_volume = cum_quote_qty
                     await self.stats.add_volume(buy_volume=buy_volume, fee=commission)
                     logger.info(f"[#{self._short_id(cl_ord_id)}] 买单成交 | price={position.buy_price} | "
@@ -633,7 +516,6 @@ class SpotVolumeV2:
 
                 elif order_status == "CANCELED":
                     if cum_filled_qty > 0:
-                        # 部分成交后取消 → 紧急市价卖出
                         actual_filled = cum_filled_qty
                         if commission_asset == self.base_asset and commission > 0:
                             actual_filled = max(cum_filled_qty - commission, Decimal("0"))
@@ -646,7 +528,6 @@ class SpotVolumeV2:
                         logger.warning(f"[#{self._short_id(cl_ord_id)}] 买单部分成交后取消 | filled={cum_filled_qty}")
                         await self._submit_emergency_sell(position, position.filled_size, self._generate_order_id("e"))
                     else:
-                        # 完全未成交取消
                         logger.info(f"[#{self._short_id(cl_ord_id)}] 买单取消（未成交）")
                         async with self.positions_lock:
                             self._delete_position(position)
@@ -664,14 +545,11 @@ class SpotVolumeV2:
 
                 if order_status == "FILLED":
                     await self._handle_sell_filled(position, msg, reason)
-
                 elif order_status == "PARTIALLY_FILLED":
                     if cl_ord_id == position.tp_cl_ord_id:
                         position.tp_filled_size = str(cum_filled_qty)
-
                 elif order_status == "CANCELED":
                     if cum_filled_qty > 0 and cl_ord_id == position.tp_cl_ord_id:
-                        # 止盈单部分成交后取消
                         position.tp_filled_size = str(cum_filled_qty)
                         avg_px = cum_quote_qty / cum_filled_qty if cum_filled_qty > 0 else Decimal("0")
                         buy_px = self._safe_decimal(position.buy_price)
@@ -679,18 +557,15 @@ class SpotVolumeV2:
                         pnl = (avg_px - buy_px) * cum_filled_qty
                         await self.stats.add_volume(sell_volume=sell_volume, pnl=pnl, fee=commission)
                         logger.warning(f"[#{self._short_id(cl_ord_id)}] 止盈单部分成交后取消 | filled={cum_filled_qty}")
-
                         if position.status != PositionStatus.CLOSING:
                             remaining = self._safe_decimal(position.filled_size) - cum_filled_qty
                             if remaining > 0:
                                 await self._submit_emergency_sell(position, self._align_qty(remaining),
                                                                   self._generate_order_id("ec"), mark_submitted=True)
                     else:
-                        # 止盈单被完全取消
                         if position.status == PositionStatus.CLOSING:
-                            pass  # 程序主动取消，等市价单
+                            pass
                         else:
-                            # 交易所自动取消 → 紧急平仓
                             filled_size = self._safe_decimal(position.filled_size)
                             if filled_size > 0:
                                 logger.warning(f"[#{self._short_id(cl_ord_id)}] 止盈单被取消，紧急平仓")
@@ -701,33 +576,56 @@ class SpotVolumeV2:
         except Exception as e:
             logger.error(f"处理 executionReport 失败: {e}", exc_info=True)
 
-    async def _handle_sell_filled(self, position: Position, msg: dict, reason: str):
-        """卖单成交，计算盈亏"""
-        cum_filled_qty = self._safe_decimal(msg.get("z"))
-        cum_quote_qty = self._safe_decimal(msg.get("Z"))
-        commission = self._safe_decimal(msg.get("n"))
+    async def _handle_sell_filled(self, position: Position, msg, reason: str):
+        cum_filled_qty = self._safe_decimal(getattr(msg, "z", None))
+        cum_quote_qty = self._safe_decimal(getattr(msg, "Z", None))
+        commission = self._safe_decimal(getattr(msg, "n", None))
         buy_price = self._safe_decimal(position.buy_price)
-
         avg_px = cum_quote_qty / cum_filled_qty if cum_filled_qty > 0 else Decimal("0")
         pnl = (avg_px - buy_price) * cum_filled_qty
         sell_volume = cum_quote_qty
-
         await self.stats.add_volume(sell_volume=sell_volume, pnl=pnl, fee=commission)
-
         position.pnl = pnl
         position.status = PositionStatus.CLOSED
         position.close_time = datetime.now()
         position.close_reason = reason
-
         reason_tag = {"take_profit": "TP", "stop_loss": "SL", "timeout": "TO", "emergency": "EM"}.get(reason, reason)
         logger.info(f"[#{self._short_id(position.buy_cl_ord_id)}] [{reason_tag}] 卖单成交 | "
                     f"price={avg_px:.6f} | qty={cum_filled_qty} | pnl={pnl:+.6f}")
-
         async with self.positions_lock:
             self._delete_position(position)
 
+    # ==================== 持仓管理 ====================
+
+    def _register_order_mapping(self, order_id, buy_cl_ord_id: str):
+        if isinstance(order_id, int) and order_id > 0:
+            self.order_id_map[order_id] = buy_cl_ord_id
+        elif isinstance(order_id, str) and order_id:
+            self.order_cl_map[order_id] = buy_cl_ord_id
+
+    def _cleanup_position_maps(self, position: Position):
+        for oid in [position.buy_cl_ord_id, position.tp_cl_ord_id,
+                    position.timeout_cl_ord_id, position.emergency_cl_ord_id]:
+            if oid:
+                self.order_cl_map.pop(oid, None)
+        for oid in [position.buy_order_id, position.tp_order_id]:
+            if oid:
+                self.order_id_map.pop(oid, None)
+
+    def _delete_position(self, position: Position):
+        self._cleanup_position_maps(position)
+        self.positions.pop(position.buy_cl_ord_id, None)
+
+    async def _find_position(self, cl_ord_id: str, order_id: int) -> Optional[Position]:
+        async with self.positions_lock:
+            buy_cl = self.order_cl_map.get(cl_ord_id) or self.order_id_map.get(order_id)
+            if buy_cl:
+                return self.positions.get(buy_cl)
+            return self.positions.get(cl_ord_id)
+
+    # ==================== 紧急平仓 ====================
+
     async def _submit_emergency_sell(self, position: Position, size: str, order_id: str, mark_submitted: bool = False):
-        """紧急市价卖出"""
         try:
             is_valid, order_value = self._check_min_order_value(size)
             if not is_valid:
@@ -747,37 +645,6 @@ class SpotVolumeV2:
         except Exception as e:
             logger.error(f"[#{self._short_id(position.buy_cl_ord_id)}] 紧急市价单失败: {e}")
 
-    # ==================== 止盈下单 ====================
-
-    async def place_take_profit_order(self, position: Position):
-        try:
-            if position.tp_cl_ord_id:
-                return
-            tp_cl_ord_id = self._generate_order_id("s")
-            position.tp_cl_ord_id = tp_cl_ord_id
-
-            async with self.positions_lock:
-                self._register_order_mapping(tp_cl_ord_id, position.buy_cl_ord_id)
-
-            # 如果止盈偏移=0，直接挂在买入价
-            tp_price = self._safe_decimal(position.take_profit_price)
-            buy_price = self._safe_decimal(position.buy_price)
-            sell_price = position.buy_price if tp_price <= buy_price else position.take_profit_price
-
-            logger.info(f"[#{self._short_id(position.buy_cl_ord_id)}] 挂止盈单 | price={sell_price} | qty={position.filled_size}")
-
-            resp = await self.ws_place_order("SELL", "LIMIT", position.filled_size, sell_price, tp_cl_ord_id)
-            result = resp.get("result", {})
-            if result.get("orderId"):
-                position.tp_order_id = result["orderId"]
-                async with self.positions_lock:
-                    self._register_order_mapping(position.tp_order_id, position.buy_cl_ord_id)
-            elif resp.get("error"):
-                raise RuntimeError(f"止盈下单失败: {resp['error']}")
-        except Exception as e:
-            logger.error(f"[#{self._short_id(position.buy_cl_ord_id)}] 止盈下单失败: {e}")
-            await self._emergency_close(position)
-
     async def _emergency_close(self, position: Position):
         try:
             is_valid, order_value = self._check_min_order_value(position.filled_size)
@@ -796,30 +663,53 @@ class SpotVolumeV2:
         except Exception as e:
             logger.error(f"[#{self._short_id(position.buy_cl_ord_id)}] 紧急平仓失败: {e}")
 
+    # ==================== 止盈下单 ====================
+
+    async def place_take_profit_order(self, position: Position):
+        try:
+            if position.tp_cl_ord_id:
+                return
+            tp_cl_ord_id = self._generate_order_id("s")
+            position.tp_cl_ord_id = tp_cl_ord_id
+            async with self.positions_lock:
+                self._register_order_mapping(tp_cl_ord_id, position.buy_cl_ord_id)
+
+            tp_price = self._safe_decimal(position.take_profit_price)
+            buy_price = self._safe_decimal(position.buy_price)
+            sell_price = position.buy_price if tp_price <= buy_price else position.take_profit_price
+            logger.info(f"[#{self._short_id(position.buy_cl_ord_id)}] 挂止盈单 | price={sell_price} | qty={position.filled_size}")
+            resp = await self.ws_place_order("SELL", "LIMIT", position.filled_size, sell_price, tp_cl_ord_id)
+            result = resp.get("result", {})
+            if result.get("orderId"):
+                position.tp_order_id = result["orderId"]
+                async with self.positions_lock:
+                    self._register_order_mapping(position.tp_order_id, position.buy_cl_ord_id)
+            elif resp.get("error"):
+                raise RuntimeError(f"止盈下单失败: {resp['error']}")
+        except Exception as e:
+            logger.error(f"[#{self._short_id(position.buy_cl_ord_id)}] 止盈下单失败: {e}")
+            await self._emergency_close(position)
+
     # ==================== 买单网格 ====================
 
     async def buy_grid_loop(self):
         logger.info("买单网格循环已启动")
         while not self.should_stop:
             try:
-                # 1. 最大成交额检查
                 if self.stats.is_max_volume_reached(self.config.max_volume):
                     logger.warning(f"累计成交额达到上限: {self.config.max_volume}")
                     os.kill(os.getpid(), signal.SIGINT)
                     break
 
-                # 2. 波动率熔断
                 await self._check_volatility()
                 if self._vol_paused:
                     await asyncio.sleep(1)
                     continue
 
-                # 3. 等待价格
                 if self.bid_price <= 0:
                     await asyncio.sleep(1)
                     continue
 
-                # 4. 计算目标网格
                 step = Decimal(str(self.config.step))
                 base_qty = Decimal(str(self.config.quantity))
                 growth = Decimal(str(self.config.size_growth_factor))
@@ -831,7 +721,6 @@ class SpotVolumeV2:
                     if Decimal(px) > 0 and Decimal(qty) > 0:
                         proposed.append((px, qty))
 
-                # 5. 收集当前状态
                 async with self.positions_lock:
                     opening_by_price = {p.buy_price: p for p in self.positions.values()
                                         if p.status == PositionStatus.OPENING}
@@ -840,13 +729,11 @@ class SpotVolumeV2:
                     net_buy = sum(Decimal(p.filled_size) for p in self.positions.values()
                                   if p.status in (PositionStatus.OPEN, PositionStatus.CLOSING))
 
-                # 5.5 库存偏斜
                 if self.config.max_net_buy > 0:
                     max_net = Decimal(str(self.config.max_net_buy))
                     ratio = float(max(1 - net_buy / max_net, 0))
                     proposed = proposed[:math.ceil(len(proposed) * ratio)]
 
-                # 6. 取消偏离档位（币安不支持改价，直接撤单）
                 target_prices = {px for px, _ in proposed}
                 stale_count = 0
                 for price_str, pos in opening_by_price.items():
@@ -858,7 +745,6 @@ class SpotVolumeV2:
                         except Exception as e:
                             logger.warning(f"[#{self._short_id(pos.buy_cl_ord_id)}] 取消买单失败: {e}")
 
-                # 7. 补下新买单
                 existing_prices = set(opening_by_price.keys()) & target_prices
                 available_slots = self.config.max_order_groups - active_count + stale_count
 
@@ -917,20 +803,16 @@ class SpotVolumeV2:
                         continue
 
                     sl_price = self._safe_decimal(position.stop_loss_price)
-
-                    # 止损
                     if self.bid_price > 0 and sl_price > 0 and self.bid_price <= sl_price:
                         await self._close_position(position, "stop_loss", "sl")
                         continue
 
-                    # 超时前检查止盈价是否在卖一价 → 重置计时
                     if position.take_profit_price and self.ask_price > 0:
                         if self._safe_decimal(position.take_profit_price) == self.ask_price:
                             async with self.positions_lock:
                                 position.open_time = datetime.now()
                             continue
 
-                    # 超时
                     if position.is_timeout(self.config.take_profit_timeout):
                         await self._close_position(position, "timeout", "timeout")
 
@@ -940,7 +822,6 @@ class SpotVolumeV2:
                 await asyncio.sleep(1)
 
     async def _close_position(self, position: Position, reason: str, suffix: str):
-        """取消止盈单 → 市价卖出剩余"""
         try:
             position.status = PositionStatus.CLOSING
             cl_ord_id = self._generate_order_id("c")
@@ -948,7 +829,6 @@ class SpotVolumeV2:
             async with self.positions_lock:
                 self._register_order_mapping(cl_ord_id, position.buy_cl_ord_id)
 
-            # 1. 取消止盈单
             cancel_success = True
             if position.tp_order_id:
                 try:
@@ -962,12 +842,10 @@ class SpotVolumeV2:
                     cancel_success = False
                     logger.error(f"[#{self._short_id(position.buy_cl_ord_id)}] 取消止盈单异常: {e}")
 
-            # 2. 计算剩余数量
             filled_size = self._safe_decimal(position.filled_size)
             tp_filled_size = self._safe_decimal(position.tp_filled_size)
             remaining = filled_size - tp_filled_size
 
-            # 3. 市价卖出
             if remaining > 0:
                 if position.emergency_submitted:
                     return
@@ -1037,26 +915,15 @@ class SpotVolumeV2:
             logger.info(f"波动率熔断解除: {ratio:.1f}x基准, 振幅{range_pct:.6f}")
 
     async def _volatility_close_all(self):
-        """熔断: 撤单 + 可选市价清仓"""
-        # 1. 标记所有活跃持仓为 CLOSING
         async with self.positions_lock:
             for pos in self.positions.values():
                 if pos.status in (PositionStatus.OPENING, PositionStatus.OPEN):
                     pos.status = PositionStatus.CLOSING
-
-        # 2. REST 批量撤单
-        try:
-            await self.rest_cancel_open_orders()
-            logger.info("熔断撤单完成")
-        except Exception as e:
-            logger.warning(f"熔断撤单失败: {e}")
-
-        # 3. 市价清仓
+        await self.rest_cancel_open_orders()
         if self.config.vol_close_on_pause:
             await self._market_close_rest()
 
     async def _market_close_rest(self):
-        """REST 查余额 → 市价清仓"""
         for attempt in range(5):
             try:
                 avail = await self.rest_get_balance(self.base_asset)
@@ -1165,7 +1032,6 @@ class SpotVolumeV2:
         mtime = self.config_path.stat().st_mtime
         if mtime <= self._last_config_mtime:
             return
-
         updated = StrategyConfig.from_yaml(str(self.config_path))
         hot_fields = [
             "quantity", "take_profit_offset", "stop_loss_offset", "order_interval",
@@ -1180,7 +1046,6 @@ class SpotVolumeV2:
             if old != new:
                 setattr(self.config, f, new)
                 changed[f] = f"{old} -> {new}"
-
         self._last_config_mtime = mtime
         if changed:
             logger.info("热加载配置成功 | " + " | ".join(f"{k}: {v}" for k, v in changed.items()))
@@ -1190,25 +1055,17 @@ class SpotVolumeV2:
     async def initialize(self):
         logger.info(f"初始化策略: {self.config.strategy_id}")
         await self.fetch_exchange_info()
+        await self._init_ws_api()
+        await self._init_ws_streams()
+        await self._init_user_data_stream()
 
-        # 启动 WS
-        asyncio.create_task(self._run_market_streams())
-        asyncio.create_task(self._run_ws_api())
-        asyncio.create_task(self._run_user_data_stream())
-        asyncio.create_task(self._keepalive_listen_key_loop())
-
-        # 等待连接就绪
-        logger.info("等待 WS 连接...")
+        logger.info("等待 BBO 数据...")
         for _ in range(30):
-            if self.ws_api and self.bid_price > 0:
+            if self.bid_price > 0:
                 break
             await asyncio.sleep(0.5)
-
-        if not self.ws_api:
-            raise RuntimeError("WS API 连接超时")
         if self.bid_price <= 0:
-            logger.warning("BBO 数据未就绪，继续等待...")
-
+            logger.warning("BBO 数据未就绪，继续运行...")
         logger.info("初始化完成，策略启动")
 
     async def run(self):
@@ -1225,7 +1082,7 @@ class SpotVolumeV2:
         except Exception as e:
             logger.error(f"策略运行错误: {e}")
         finally:
-            if hasattr(self, "strategy_tasks") and self.strategy_tasks:
+            if self.strategy_tasks:
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(*self.strategy_tasks, return_exceptions=True), timeout=1.0)
@@ -1235,23 +1092,14 @@ class SpotVolumeV2:
 
     async def shutdown(self):
         logger.info("正在关闭策略...")
-
-        # 1. 标记所有活跃持仓为CLOSING
         async with self.positions_lock:
             for pos in self.positions.values():
                 if pos.status in (PositionStatus.OPENING, PositionStatus.OPEN):
                     pos.status = PositionStatus.CLOSING
 
-        # 2. REST 批量撤单
-        try:
-            await self.rest_cancel_open_orders()
-            logger.info("批量撤单完成")
-        except Exception as e:
-            logger.warning(f"批量撤单失败: {e}")
-
+        await self.rest_cancel_open_orders()
         await asyncio.sleep(0.5)
 
-        # 3. 清仓
         if self.config.auto_close_on_exit and self.base_asset:
             try:
                 avail = await self.rest_get_balance(self.base_asset)
@@ -1264,15 +1112,18 @@ class SpotVolumeV2:
             except Exception as e:
                 logger.warning(f"清仓失败: {e}")
 
-        # 4. 保存状态
         try:
             await asyncio.wait_for(self.stats.save_state(), timeout=2.0)
         except Exception as e:
             logger.error(f"保存状态失败: {e}")
 
-        # 5. 关闭 HTTP session
-        if self._http_session and not self._http_session.closed:
-            await self._http_session.close()
+        # 关闭 SDK 连接
+        for conn in (self.ws_api_conn, self.ws_streams_conn):
+            if conn:
+                try:
+                    await conn.close_connection()
+                except Exception:
+                    pass
 
         logger.info("策略已安全关闭")
 
@@ -1298,28 +1149,22 @@ def handle_exception(_loop, context):
 
 
 async def main():
-    load_dotenv()
     config_path = os.getenv("CONFIG_FILE", str(Path(__file__).parent / "config.yaml"))
     config = StrategyConfig.from_yaml(config_path)
-    config.api_key = os.getenv("BINANCE_API_KEY", "")
-    config.private_key_path = os.getenv("BINANCE_PRIVATE_KEY_PATH", "")
-    config.demo = os.getenv("BINANCE_DEMO", "0") == "1"
     config.validate()
     setup_logger(config.strategy_id)
 
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(handle_exception)
 
-    mode = "Demo" if config.demo else "Live"
     logger.info(
         f"\n{'='*70}\n"
-        f"币安现货刷量策略V2 - 买侧网格 + 止盈止损\n"
+        f"币安现货刷量策略V2 - 买侧网格 + 止盈止损 (SDK 版)\n"
         f"策略ID: {config.strategy_id} | 交易对: {config.symbol}\n"
         f"数量: {config.quantity} | 止盈: +{config.take_profit_offset} | 止损: -{config.stop_loss_offset}\n"
         f"网格: step={config.step} levels={config.num_levels} start={config.start_level} growth={config.size_growth_factor}\n"
         f"熔断: pause={config.vol_pause_multiplier}x resume={config.vol_resume_multiplier}x close={config.vol_close_on_pause}\n"
         f"最大订单组: {config.max_order_groups} | 累计上限: {config.max_volume}\n"
-        f"模式: {mode}\n"
         f"{'='*70}"
     )
 
@@ -1328,19 +1173,16 @@ async def main():
     def signal_handler(_sig, _frame):
         logger.warning("收到停止信号，正在安全退出...")
         strategy.should_stop = True
-        if hasattr(strategy, "strategy_tasks"):
-            for task in strategy.strategy_tasks:
-                task.cancel()
+        for task in strategy.strategy_tasks:
+            task.cancel()
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
         await strategy.run()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         strategy.should_stop = True
-    except asyncio.CancelledError:
-        pass
     except Exception as e:
         logger.error(f"策略异常退出: {e}")
         raise
