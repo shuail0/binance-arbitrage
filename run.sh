@@ -74,8 +74,13 @@ case "$ACTION" in
         ;;
     stop)
         if screen -ls | grep -q "$SCREEN_NAME"; then
+            # 发送 SIGINT 触发策略 shutdown (撤单 + 清仓 + 保存状态)
+            # swap_volume shutdown 最长可达 15s, 这里等 20s 留余量
             screen -S "$SCREEN_NAME" -X stuff $'\003'
-            sleep 3
+            for i in $(seq 1 20); do
+                screen -ls | grep -q "$SCREEN_NAME" || break
+                sleep 1
+            done
             screen -ls | grep -q "$SCREEN_NAME" && screen -S "$SCREEN_NAME" -X quit
             echo -e "${GREEN}✅ $SCREEN_NAME 已停止${NC}"
         else

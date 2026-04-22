@@ -17,7 +17,7 @@ from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 import aiohttp
 import websockets
@@ -279,6 +279,9 @@ class SpotVolumeV2:
         self.ws_api_responses: dict[str, asyncio.Future] = {}
         self.ws_api_id_counter = 0
 
+        # HTTP session (持久化, 复用 TCP+TLS)
+        self._http_session: Optional[aiohttp.ClientSession] = None
+
         # 波动率
         self.vol_tracker = VolatilityTracker()
         self._vol_paused = False
@@ -340,25 +343,21 @@ class SpotVolumeV2:
 
     # ==================== REST ====================
 
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        """懒加载持久 HTTP session, 复用 TCP+TLS 连接"""
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
     async def _rest_request(self, method: str, path: str, params: dict = None, signed: bool = False) -> dict:
         url = f"{self.rest_base}{path}"
         headers = {"X-MBX-APIKEY": self.config.api_key}
         params = params or {}
         if signed:
             params = self._sign_params(params)
-        async with aiohttp.ClientSession() as session:
-            if method == "GET":
-                async with session.get(url, params=params, headers=headers) as resp:
-                    return await resp.json()
-            elif method == "POST":
-                async with session.post(url, params=params, headers=headers) as resp:
-                    return await resp.json()
-            elif method == "PUT":
-                async with session.put(url, params=params, headers=headers) as resp:
-                    return await resp.json()
-            elif method == "DELETE":
-                async with session.delete(url, params=params, headers=headers) as resp:
-                    return await resp.json()
+        session = await self._get_http_session()
+        async with session.request(method, url, params=params, headers=headers) as resp:
+            return await resp.json()
 
     async def fetch_exchange_info(self):
         data = await self._rest_request("GET", "/api/v3/exchangeInfo", {"symbol": self.config.symbol})
@@ -494,7 +493,7 @@ class SpotVolumeV2:
         req_id = f"req_{self.ws_api_id_counter}"
         params = self._sign_params(params)
         payload = {"id": req_id, "method": method, "params": {**params, "apiKey": self.config.api_key}}
-        fut = asyncio.get_event_loop().create_future()
+        fut = asyncio.get_running_loop().create_future()
         self.ws_api_responses[req_id] = fut
         await self.ws_api.send(json.dumps(payload))
         try:
@@ -1271,6 +1270,10 @@ class SpotVolumeV2:
         except Exception as e:
             logger.error(f"保存状态失败: {e}")
 
+        # 5. 关闭 HTTP session
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+
         logger.info("策略已安全关闭")
 
 
@@ -1304,7 +1307,7 @@ async def main():
     config.validate()
     setup_logger(config.strategy_id)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     loop.set_exception_handler(handle_exception)
 
     mode = "Demo" if config.demo else "Live"

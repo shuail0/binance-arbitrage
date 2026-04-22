@@ -14,7 +14,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from openpyxl import load_workbook
 from getpass import getpass
-from datetime import datetime
 
 MAX_RETRIES = 3
 RETRY_DELAY = 2
@@ -30,7 +29,8 @@ EXCEL_PATH = str(Path(__file__).resolve().parents[1] / "keys" / "币安API.xlsx"
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 REMOTE_DIR = "/home/ubuntu/binance"
 SSH_USER = "ubuntu"
-DEFAULT_SSH_PASSWORD = "LIshuai110110"
+# SSH 密码不硬编码。可通过环境变量 SSH_PASSWORD 注入 (如 export 或 .env), 否则交互式 getpass
+DEFAULT_SSH_PASSWORD = os.getenv("SSH_PASSWORD", "")
 CONDA_ENV = "binance"
 
 STRATEGY_MAP = {
@@ -297,7 +297,7 @@ def sync_server(server, password, strategies_to_sync, rand_qty=False, rand_vol=F
 
     env_content = (
         f"BINANCE_API_KEY={api_key}\n"
-        f"BINANCE_API_SECRET={remote_key_path}\n"
+        f"BINANCE_PRIVATE_KEY_PATH={remote_key_path}\n"
         f"BINANCE_DEMO=0\n"
     )
     with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
@@ -401,17 +401,22 @@ def deploy_server(server, password, full_setup=False):
     # 2. 上传代码 (rsync 排除配置和日志)
     with print_lock:
         print(f"[{server_id}] [2/{total_steps}] 上传代码...")
-    exclude = "--exclude='.env' --exclude='__pycache__' --exclude='logs/' --exclude='.git' --exclude='keys/'"
+    exclude_args = [
+        "--exclude=.env", "--exclude=__pycache__", "--exclude=logs/",
+        "--exclude=.git", "--exclude=keys/",
+    ]
     for name in ("strategies", "tools"):
         local = PROJECT_DIR / name
         if not local.exists():
             continue
-        cmd = (
-            f"sshpass -p '{password}' rsync -az {exclude} "
-            f"-e 'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10' "
-            f"{local}/ {SSH_USER}@{ip}:{REMOTE_DIR}/{name}/"
-        )
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+        # 列表参数 + shell=False, 避免密码/IP 中特殊字符被 shell 注入
+        cmd = [
+            "sshpass", "-p", password,
+            "rsync", "-az", *exclude_args,
+            "-e", "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10",
+            f"{local}/", f"{SSH_USER}@{ip}:{REMOTE_DIR}/{name}/",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
             with print_lock:
                 print(f"[{server_id}] ❌ 上传 {name} 失败: {result.stderr}")
@@ -433,7 +438,7 @@ def deploy_server(server, password, full_setup=False):
     key_filename = os.path.basename(key_path) if key_path else ""
     remote_key_path = f"{REMOTE_DIR}/{key_filename}" if key_filename else ""
 
-    env_content = f"BINANCE_API_KEY={api_key}\nBINANCE_API_SECRET={remote_key_path}\nBINANCE_DEMO=0\n"
+    env_content = f"BINANCE_API_KEY={api_key}\nBINANCE_PRIVATE_KEY_PATH={remote_key_path}\nBINANCE_DEMO=0\n"
     tmp_env = Path("/tmp") / f".env_bnc_{ip}"
     tmp_env.write_text(env_content)
     success, error = upload_files(ip, password, tmp_env, f"{REMOTE_DIR}/.env", retry=True)
@@ -749,9 +754,9 @@ def view_config(server, mode, name, desc, password, display_mode='formatted'):
             if "=" in line and not line.startswith("#"):
                 key, val = line.split("=", 1)
                 key = key.strip()
-                if key in ("BINANCE_API_KEY",) and len(val) > 10:
+                if key == "BINANCE_API_KEY" and len(val) > 10:
                     print(f"  {key}={val[:6]}...{val[-4:]}")
-                elif key == "BINANCE_API_SECRET":
+                elif key == "BINANCE_PRIVATE_KEY_PATH":
                     print(f"  {key}={os.path.basename(val)}")
                 else:
                     print(f"  {line}")

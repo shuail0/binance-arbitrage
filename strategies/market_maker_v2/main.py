@@ -13,7 +13,7 @@ import time
 import uuid
 from base64 import b64encode
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
@@ -225,6 +225,9 @@ class MarketMaker:
         self.ws_api_responses: dict[str, asyncio.Future] = {}
         self.ws_api_id_counter = 0
 
+        # HTTP session (持久化, 复用 TCP+TLS)
+        self._http_session: Optional[aiohttp.ClientSession] = None
+
         # 波动率
         self.vol_tracker = VolatilityTracker()
         self._vol_paused = False
@@ -313,16 +316,21 @@ class MarketMaker:
 
     # ─── REST ────────────────────────────────────────────────────────────────
 
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        """懒加载持久 HTTP session, 复用 TCP+TLS 连接"""
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
     async def _rest_request(self, method: str, path: str, params: dict = None, signed: bool = False) -> dict:
         url = f"{self.rest_base}{path}"
         headers = {"X-MBX-APIKEY": self.api_key}
         params = params or {}
         if signed:
             params = self._sign_params(params)
-        async with aiohttp.ClientSession() as session:
-            req_method = getattr(session, method.lower())
-            async with req_method(url, params=params, headers=headers) as resp:
-                return await resp.json()
+        session = await self._get_http_session()
+        async with session.request(method, url, params=params, headers=headers) as resp:
+            return await resp.json()
 
     async def _fetch_exchange_info(self):
         data = await self._rest_request("GET", "/api/v3/exchangeInfo", {"symbol": self.instrument_id})
@@ -476,7 +484,7 @@ class MarketMaker:
         req_id = f"req_{self.ws_api_id_counter}"
         params = self._sign_params(params)
         payload = {"id": req_id, "method": method, "params": {**params, "apiKey": self.api_key}}
-        fut = asyncio.get_event_loop().create_future()
+        fut = asyncio.get_running_loop().create_future()
         self.ws_api_responses[req_id] = fut
         await self.ws_api.send(json.dumps(payload))
         try:
@@ -814,9 +822,11 @@ class MarketMaker:
                         cancel_tasks.append(self._cancel_order(order))
                     results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
                     for order, result in zip(all_cancel, results):
-                        if result is True or isinstance(result, bool):
+                        if result is True:
+                            # 撤单成功, 从本地移除
                             self.orders.pop(order.cl_ord_id, None)
                         else:
+                            # 撤单失败或异常: 保留订单, 清 pending 以便下轮重试撤单
                             order.pending = False
 
                 if all_place:
@@ -1200,6 +1210,10 @@ class MarketMaker:
         if self._csv_file:
             self._csv_file.close()
 
+        # 5. 关闭 HTTP session
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+
         logger.info("策略已安全关闭")
 
 
@@ -1237,7 +1251,7 @@ async def main():
     assert api_key and private_key_path, "请在 .env 中配置 BINANCE_API_KEY 和 BINANCE_PRIVATE_KEY_PATH"
 
     setup_logger(instrument_id)
-    asyncio.get_event_loop().set_exception_handler(handle_exception)
+    asyncio.get_running_loop().set_exception_handler(handle_exception)
 
     mm = MarketMaker(instrument_id, api_key, private_key_path, demo)
 

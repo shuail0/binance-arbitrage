@@ -4,14 +4,12 @@
 通信：WS Streams(bookTicker) + WS API(order_place) + REST(exchangeInfo)
 """
 import asyncio
-import hashlib
-import hmac
 import json
 import os
 import signal
 import time as time_mod
 from base64 import b64encode
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -79,6 +77,9 @@ class InstantVolumeStrategy:
         self.ws_api_responses: dict[str, asyncio.Future] = {}
         self.ws_api_id_counter = 0
 
+        # HTTP session (持久化, 复用 TCP+TLS)
+        self._http_session: Optional[aiohttp.ClientSession] = None
+
         # 控制
         self.should_stop = False
 
@@ -114,12 +115,18 @@ class InstantVolumeStrategy:
 
     # ==================== REST ====================
 
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        """懒加载持久 HTTP session, 复用 TCP+TLS 连接"""
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
     async def fetch_exchange_info(self):
         """REST 获取 exchangeInfo"""
         url = f"{self.rest_base}/api/v3/exchangeInfo"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params={"symbol": self.config.symbol}) as resp:
-                data = await resp.json()
+        session = await self._get_http_session()
+        async with session.get(url, params={"symbol": self.config.symbol}) as resp:
+            data = await resp.json()
 
         if not data.get("symbols"):
             raise RuntimeError(f"交易对 {self.config.symbol} 未找到")
@@ -139,9 +146,9 @@ class InstantVolumeStrategy:
         url = f"{self.rest_base}/api/v3/account"
         params = self._sign_params({})
         headers = {"X-MBX-APIKEY": self.config.api_key}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers) as resp:
-                data = await resp.json()
+        session = await self._get_http_session()
+        async with session.get(url, params=params, headers=headers) as resp:
+            data = await resp.json()
         for b in data.get("balances", []):
             if b["asset"] == asset:
                 return Decimal(b["free"])
@@ -157,13 +164,13 @@ class InstantVolumeStrategy:
             "quantity": qty,
         })
         headers = {"X-MBX-APIKEY": self.config.api_key}
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, params=params, headers=headers) as resp:
-                result = await resp.json()
-                if resp.status == 200:
-                    logger.info(f"市价卖出成功 | orderId={result.get('orderId')}")
-                else:
-                    logger.error(f"市价卖出失败: {result}")
+        session = await self._get_http_session()
+        async with session.post(url, params=params, headers=headers) as resp:
+            result = await resp.json()
+            if resp.status == 200:
+                logger.info(f"市价卖出成功 | orderId={result.get('orderId')}")
+            else:
+                logger.error(f"市价卖出失败: {result}")
 
     # ==================== WS Streams (bookTicker) ====================
 
@@ -230,7 +237,7 @@ class InstantVolumeStrategy:
             "params": {**params, "apiKey": self.config.api_key},
         }
 
-        fut = asyncio.get_event_loop().create_future()
+        fut = asyncio.get_running_loop().create_future()
         self.ws_api_responses[req_id] = fut
 
         await self.ws_api.send(json.dumps(payload))
@@ -345,17 +352,18 @@ class InstantVolumeStrategy:
                 await self.rest_place_market_sell(sell_qty)
                 return
 
-            # 提取卖单成交信息
+            # 提取卖单成交信息 (用实际卖出数量而非 buy_fill_qty, 因对齐可能变小)
             sell_fill_price = self._extract_fill_price(sell_result, Decimal(sell_price))
-            sell_vol = sell_fill_price * buy_fill_qty
-            pnl = (sell_fill_price - buy_fill_price) * buy_fill_qty
+            sell_fill_qty = Decimal(sell_result.get("executedQty", sell_qty))
+            sell_vol = sell_fill_price * sell_fill_qty
+            pnl = (sell_fill_price - buy_fill_price) * sell_fill_qty
 
             self.total_sell_volume += sell_vol
             self.total_pnl += pnl
             self.order_count += 1
 
             pnl_str = f"+{pnl}" if pnl >= 0 else str(pnl)
-            logger.info(f"卖单成交 | {sell_qty} @ {sell_fill_price} | 盈亏={pnl_str} | 累计={self.total_pnl:+.6f}")
+            logger.info(f"卖单成交 | {sell_fill_qty} @ {sell_fill_price} | 盈亏={pnl_str} | 累计={self.total_pnl:+.6f}")
 
         except Exception as e:
             logger.error(f"执行循环错误: {e}")
@@ -457,6 +465,8 @@ class InstantVolumeStrategy:
             logger.error(f"策略运行错误: {e}")
         finally:
             await self._save_state()
+            if self._http_session and not self._http_session.closed:
+                await self._http_session.close()
 
     async def shutdown(self):
         """安全退出"""
@@ -503,7 +513,7 @@ async def main():
 
     strategy = InstantVolumeStrategy(config)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(strategy.shutdown()))
 

@@ -10,7 +10,6 @@ import os
 import signal
 import sys
 import time
-import uuid
 from base64 import b64encode
 from collections import deque
 from dataclasses import dataclass
@@ -24,6 +23,7 @@ import websockets
 import yaml
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from dotenv import load_dotenv
 from loguru import logger
 
 
@@ -246,6 +246,9 @@ class SwapVolume:
         # User Data Stream
         self.listen_key: Optional[str] = None
 
+        # HTTP session (持久化, 复用 TCP+TLS; 合约和现货 BNB 共用)
+        self._http_session: Optional[aiohttp.ClientSession] = None
+
         # 控制
         self._order_seq = 0
         self._last_reconcile = 0.0
@@ -331,6 +334,12 @@ class SwapVolume:
 
     # ─── REST (合约) ─────────────────────────────────────────────────────────
 
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        """懒加载持久 HTTP session, 复用 TCP+TLS 连接"""
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
     async def _futures_rest(self, method: str, path: str, params: dict = None,
                             signed: bool = True) -> dict | list:
         url = f"{self.rest_base}{path}"
@@ -338,16 +347,9 @@ class SwapVolume:
         params = dict(params or {})
         if signed:
             params = self._sign_params(params)
-        async with aiohttp.ClientSession() as session:
-            if method == "GET":
-                async with session.get(url, params=params, headers=headers) as resp:
-                    return await resp.json()
-            elif method == "DELETE":
-                async with session.delete(url, params=params, headers=headers) as resp:
-                    return await resp.json()
-            else:
-                async with session.request(method, url, params=params, headers=headers) as resp:
-                    return await resp.json()
+        session = await self._get_http_session()
+        async with session.request(method, url, params=params, headers=headers) as resp:
+            return await resp.json()
 
     async def _spot_rest(self, method: str, path: str, params: dict = None,
                          signed: bool = True) -> dict | list:
@@ -356,10 +358,9 @@ class SwapVolume:
         params = dict(params or {})
         if signed:
             params = self._sign_params(params)
-        async with aiohttp.ClientSession() as session:
-            req = getattr(session, method.lower())
-            async with req(url, params=params, headers=headers) as resp:
-                return await resp.json()
+        session = await self._get_http_session()
+        async with session.request(method, url, params=params, headers=headers) as resp:
+            return await resp.json()
 
     # ─── 初始化 ──────────────────────────────────────────────────────────────
 
@@ -419,7 +420,8 @@ class SwapVolume:
     # ─── Listen Key ──────────────────────────────────────────────────────────
 
     async def _get_listen_key(self) -> str:
-        data = await self._futures_rest("POST", "/fapi/v1/listenKey")
+        # USER_STREAM 类型接口: 仅需 API Key header, 不需要签名
+        data = await self._futures_rest("POST", "/fapi/v1/listenKey", signed=False)
         return data["listenKey"]
 
     async def _keepalive_listen_key_loop(self):
@@ -427,7 +429,7 @@ class SwapVolume:
             try:
                 await asyncio.sleep(30 * 60)
                 if self.listen_key:
-                    await self._futures_rest("PUT", "/fapi/v1/listenKey")
+                    await self._futures_rest("PUT", "/fapi/v1/listenKey", signed=False)
                     logger.debug("listenKey keepalive 完成")
             except Exception as e:
                 logger.warning(f"listenKey keepalive 失败: {e}")
@@ -1299,6 +1301,10 @@ class SwapVolume:
         if self._csv_file:
             self._csv_file.close()
 
+        # 关闭 HTTP session
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+
         logger.info("策略已安全关闭")
 
 
@@ -1323,16 +1329,23 @@ def handle_exception(_loop, context):
 
 
 async def main():
+    load_dotenv()
     config_path = Path(__file__).parent / "config.yaml"
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
-    assert cfg.get("apiKey") and cfg.get("privateKeyPath"), "请在 config.yaml 中配置 apiKey 和 privateKeyPath"
+    # 凭证从 .env 读取 (与现货策略统一)
+    cfg["apiKey"] = os.getenv("BINANCE_API_KEY", "")
+    cfg["privateKeyPath"] = os.getenv("BINANCE_PRIVATE_KEY_PATH", "")
+    cfg["demo"] = os.getenv("BINANCE_DEMO", "0") == "1"
+
+    assert cfg["apiKey"] and cfg["privateKeyPath"], \
+        "请在 .env 配置 BINANCE_API_KEY 和 BINANCE_PRIVATE_KEY_PATH"
 
     symbol = cfg.get("symbol", "BTCUSDT")
-    demo = cfg.get("demo", False)
+    demo = cfg["demo"]
     setup_logger(symbol)
-    asyncio.get_event_loop().set_exception_handler(handle_exception)
+    asyncio.get_running_loop().set_exception_handler(handle_exception)
 
     s = cfg.get("strategy", {})
     mode = "Demo" if demo else "Live"

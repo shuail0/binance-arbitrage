@@ -4,8 +4,6 @@ import os
 import sys
 import json
 import time
-import hmac
-import hashlib
 import base64
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
@@ -21,7 +19,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 load_dotenv()
 
 BASE_URL = "https://api.binance.com"
-DEMO_URL = "https://testnet.binance.vision"
+# 与现货策略保持一致 (币安账号内 Demo, 而非独立的 testnet.binance.vision)
+DEMO_URL = "https://demo-api.binance.com"
 
 
 class Liquidator:
@@ -30,29 +29,21 @@ class Liquidator:
         self.base_ccy = self._parse_base(self.symbol)
 
         self.api_key = os.getenv("BINANCE_API_KEY", "")
-        key_path = os.getenv("BINANCE_API_SECRET", "")
+        key_path = os.getenv("BINANCE_PRIVATE_KEY_PATH", "")
         self.demo = os.getenv("BINANCE_DEMO", "0") == "1"
         self.base_url = DEMO_URL if self.demo else BASE_URL
 
         if not self.api_key:
             raise ValueError("缺少 BINANCE_API_KEY，请检查 .env")
+        if not key_path:
+            raise ValueError("缺少 BINANCE_PRIVATE_KEY_PATH，请检查 .env")
+        if not Path(key_path).exists():
+            raise FileNotFoundError(f"私钥文件不存在: {key_path}")
 
-        # 加载签名密钥
-        self.private_key = None
-        self.use_ed25519 = False
-        if key_path and Path(key_path).exists():
-            pem_data = Path(key_path).read_bytes()
-            pk = load_pem_private_key(pem_data, password=None)
-            if isinstance(pk, Ed25519PrivateKey):
-                self.private_key = pk
-                self.use_ed25519 = True
-            else:
-                raise ValueError(f"不支持的密钥类型: {type(pk)}")
-        elif key_path and not Path(key_path).exists():
-            # key_path 是 HMAC secret
-            self.hmac_secret = key_path
-        else:
-            raise ValueError("缺少签名密钥，请在 .env 设置 BINANCE_API_SECRET")
+        pk = load_pem_private_key(Path(key_path).read_bytes(), password=None)
+        if not isinstance(pk, Ed25519PrivateKey):
+            raise ValueError(f"不支持的密钥类型: {type(pk).__name__}，币安 API 仅支持 Ed25519")
+        self.private_key = pk
 
         # 交易对精度信息
         self.step_size = Decimal('0')
@@ -68,16 +59,11 @@ class Liquidator:
         return symbol[:3]
 
     def _sign(self, params: dict) -> dict:
-        """对参数签名"""
+        """Ed25519 签名"""
         params["timestamp"] = int(time.time() * 1000)
         query = urlencode(params)
-
-        if self.use_ed25519:
-            sig = self.private_key.sign(query.encode())
-            params["signature"] = base64.b64encode(sig).decode()
-        else:
-            sig = hmac.new(self.hmac_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-            params["signature"] = sig
+        sig = self.private_key.sign(query.encode())
+        params["signature"] = base64.b64encode(sig).decode()
         return params
 
     def _headers(self) -> dict:
