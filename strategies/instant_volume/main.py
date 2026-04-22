@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
-"""币安即时刷量策略 - 极简版
-策略逻辑：卖一价FOK买入 → 买一价FOK卖出 → 达到maxVolume后清仓退出
-通信：WS Streams(bookTicker) + WS API(order_place) + REST(exchangeInfo)
+"""币安即时刷量策略 (SDK 版)
+
+策略逻辑: 卖一价 FOK 买入 → 买一价 FOK 卖出 → 达到 maxVolume 后清仓退出
+SDK: binance-sdk-spot (REST + WS API + WS Streams 全走官方)
 """
 import asyncio
 import json
-import os
 import signal
-import time as time_mod
-from base64 import b64encode
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
-import aiohttp
-import websockets
 import yaml
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
-from dotenv import load_dotenv
 from loguru import logger
 
-load_dotenv()
+# 使项目根目录可 import strategies.common
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from strategies.common import load_credentials, make_spot_client
+from strategies.common.ws_errors import parse_ws_error
+
 
 logger.remove()
 logger.add(lambda msg: print(msg, end=""), level="INFO")
@@ -38,26 +36,13 @@ class StrategyConfig:
     order_interval: float
     max_volume: float
     order_timeout: int = 30
-    api_key: str = ""
-    api_secret: str = ""  # PEM 文件路径
-    demo: bool = False
 
 
 class InstantVolumeStrategy:
     def __init__(self, config: StrategyConfig):
         self.config = config
-        self._private_key: Optional[Ed25519PrivateKey] = None
-        self._load_private_key()
-
-        # URL
-        if config.demo:
-            self.rest_base = "https://demo-api.binance.com"
-            self.ws_api_url = "wss://demo-ws-api.binance.com:443/ws-api/v3"
-            self.ws_stream_url = "wss://demo-stream.binance.com:9443"
-        else:
-            self.rest_base = "https://api.binance.com"
-            self.ws_api_url = "wss://ws-api.binance.com:443/ws-api/v3"
-            self.ws_stream_url = "wss://stream.binance.com:9443"
+        creds = load_credentials()
+        self.client = make_spot_client(creds)
 
         # 市场数据
         self.bid_price = Decimal("0")
@@ -72,194 +57,135 @@ class InstantVolumeStrategy:
         self.total_pnl = Decimal("0")
         self.order_count = 0
 
-        # WS API
-        self.ws_api: Optional[websockets.WebSocketClientProtocol] = None
-        self.ws_api_responses: dict[str, asyncio.Future] = {}
-        self.ws_api_id_counter = 0
-
-        # HTTP session (持久化, 复用 TCP+TLS)
-        self._http_session: Optional[aiohttp.ClientSession] = None
+        # SDK 连接句柄
+        self.ws_api_conn = None
+        self.ws_streams_conn = None
 
         # 控制
         self.should_stop = False
 
-    def _load_private_key(self):
-        """加载 Ed25519 私钥"""
-        pem_path = self.config.api_secret
-        if not pem_path or not os.path.exists(pem_path):
-            raise FileNotFoundError(f"私钥文件不存在: {pem_path}")
-        pem_data = Path(pem_path).read_bytes()
-        self._private_key = load_pem_private_key(pem_data, password=None)
+    # ==================== 价格对齐 ====================
 
-    def _sign(self, payload: str) -> str:
-        """Ed25519 签名"""
-        signature = self._private_key.sign(payload.encode())
-        return b64encode(signature).decode()
-
-    def _sign_params(self, params: dict) -> dict:
-        """对参数进行签名，添加 timestamp + signature"""
-        params["timestamp"] = str(int(time_mod.time() * 1000))
-        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-        params["signature"] = self._sign(query)
-        return params
-
-    def _align_price(self, price: Decimal) -> str:
+    def _align_price(self, price: Decimal) -> Decimal:
         if self.tick_size <= 0:
-            return str(price)
-        return str((price / self.tick_size).to_integral_value() * self.tick_size)
+            return price
+        return (price / self.tick_size).to_integral_value() * self.tick_size
 
-    def _align_qty(self, qty: Decimal) -> str:
+    def _align_qty(self, qty: Decimal) -> Decimal:
         if self.step_size <= 0:
-            return str(qty)
-        return str((qty / self.step_size).to_integral_value() * self.step_size)
+            return qty
+        return (qty / self.step_size).to_integral_value() * self.step_size
 
     # ==================== REST ====================
 
-    async def _get_http_session(self) -> aiohttp.ClientSession:
-        """懒加载持久 HTTP session, 复用 TCP+TLS 连接"""
-        if self._http_session is None or self._http_session.closed:
-            self._http_session = aiohttp.ClientSession()
-        return self._http_session
-
     async def fetch_exchange_info(self):
         """REST 获取 exchangeInfo"""
-        url = f"{self.rest_base}/api/v3/exchangeInfo"
-        session = await self._get_http_session()
-        async with session.get(url, params={"symbol": self.config.symbol}) as resp:
-            data = await resp.json()
-
-        if not data.get("symbols"):
+        resp = await asyncio.to_thread(
+            self.client.rest_api.exchange_info, symbol=self.config.symbol
+        )
+        data = resp.data()
+        if not data.symbols:
             raise RuntimeError(f"交易对 {self.config.symbol} 未找到")
 
-        sym = data["symbols"][0]
-        self.base_asset = sym["baseAsset"]
-        for f in sym["filters"]:
-            if f["filterType"] == "PRICE_FILTER":
-                self.tick_size = Decimal(f["tickSize"])
-            elif f["filterType"] == "LOT_SIZE":
-                self.step_size = Decimal(f["stepSize"])
+        sym = data.symbols[0]
+        self.base_asset = sym.base_asset
+        for f in sym.filters:
+            # SDK 返回 Pydantic 模型, 过滤器是 Union 类型, 用属性访问
+            ftype = getattr(f, "filter_type", None) or getattr(f, "filterType", None)
+            if ftype == "PRICE_FILTER":
+                self.tick_size = Decimal(str(f.tick_size))
+            elif ftype == "LOT_SIZE":
+                self.step_size = Decimal(str(f.step_size))
 
-        logger.info(f"交易规则 | {self.config.symbol} | baseAsset={self.base_asset} | tickSize={self.tick_size} | stepSize={self.step_size}")
+        logger.info(
+            f"交易规则 | {self.config.symbol} | baseAsset={self.base_asset} | "
+            f"tickSize={self.tick_size} | stepSize={self.step_size}"
+        )
 
     async def rest_get_balance(self, asset: str) -> Decimal:
         """REST 查询可用余额"""
-        url = f"{self.rest_base}/api/v3/account"
-        params = self._sign_params({})
-        headers = {"X-MBX-APIKEY": self.config.api_key}
-        session = await self._get_http_session()
-        async with session.get(url, params=params, headers=headers) as resp:
-            data = await resp.json()
-        for b in data.get("balances", []):
-            if b["asset"] == asset:
-                return Decimal(b["free"])
+        resp = await asyncio.to_thread(self.client.rest_api.get_account)
+        data = resp.data()
+        for b in data.balances or []:
+            if b.asset == asset:
+                return Decimal(str(b.free))
         return Decimal("0")
 
-    async def rest_place_market_sell(self, qty: str):
-        """REST 市价卖出（清仓用）"""
-        url = f"{self.rest_base}/api/v3/order"
-        params = self._sign_params({
-            "symbol": self.config.symbol,
-            "side": "SELL",
-            "type": "MARKET",
-            "quantity": qty,
-        })
-        headers = {"X-MBX-APIKEY": self.config.api_key}
-        session = await self._get_http_session()
-        async with session.post(url, params=params, headers=headers) as resp:
-            result = await resp.json()
-            if resp.status == 200:
-                logger.info(f"市价卖出成功 | orderId={result.get('orderId')}")
-            else:
-                logger.error(f"市价卖出失败: {result}")
+    async def rest_place_market_sell(self, qty: Decimal):
+        """REST 市价卖出 (清仓用)"""
+        try:
+            resp = await asyncio.to_thread(
+                self.client.rest_api.new_order,
+                symbol=self.config.symbol,
+                side="SELL",
+                type="MARKET",
+                quantity=float(qty),
+            )
+            result = resp.data()
+            order_id = getattr(result, "order_id", None) or getattr(result, "orderId", None)
+            logger.info(f"市价卖出成功 | orderId={order_id}")
+        except Exception as e:
+            logger.error(f"市价卖出失败: {e}")
 
     # ==================== WS Streams (bookTicker) ====================
 
-    async def _run_book_ticker(self):
-        """订阅 bookTicker 实时 BBO"""
-        stream = f"{self.config.symbol.lower()}@bookTicker"
-        url = f"{self.ws_stream_url}/ws/{stream}"
-        while not self.should_stop:
-            try:
-                async with websockets.connect(url, ping_interval=20) as ws:
-                    logger.info(f"WS Streams 已连接 | {stream}")
-                    async for raw in ws:
-                        if self.should_stop:
-                            break
-                        msg = json.loads(raw)
-                        if "b" in msg and "a" in msg:
-                            self.bid_price = Decimal(msg["b"])
-                            self.ask_price = Decimal(msg["a"])
-            except (websockets.ConnectionClosed, Exception) as e:
-                if self.should_stop:
-                    break
-                logger.warning(f"WS Streams 断线: {e}，3秒后重连...")
-                await asyncio.sleep(3)
+    async def subscribe_book_ticker(self):
+        """订阅 bookTicker 实时 BBO (SDK 内置自动重连)"""
+        self.ws_streams_conn = await self.client.websocket_streams.create_connection()
+        handle = await self.ws_streams_conn.book_ticker(symbol=self.config.symbol.lower())
+        handle.on("message", self._on_book_ticker)
+        logger.info(f"WS Streams 已订阅 | {self.config.symbol}@bookTicker")
 
-    # ==================== WS API (order_place) ====================
-
-    async def _run_ws_api(self):
-        """维护 WS API 连接"""
-        while not self.should_stop:
-            try:
-                async with websockets.connect(self.ws_api_url, ping_interval=20, max_size=2**22) as ws:
-                    self.ws_api = ws
-                    logger.info("WS API 已连接")
-                    async for raw in ws:
-                        if self.should_stop:
-                            break
-                        msg = json.loads(raw)
-                        req_id = msg.get("id")
-                        if req_id and req_id in self.ws_api_responses:
-                            fut = self.ws_api_responses.pop(req_id)
-                            if not fut.done():
-                                fut.set_result(msg)
-            except (websockets.ConnectionClosed, Exception) as e:
-                if self.should_stop:
-                    break
-                self.ws_api = None
-                logger.warning(f"WS API 断线: {e}，3秒后重连...")
-                await asyncio.sleep(3)
-
-    async def _ws_api_request(self, method: str, params: dict, timeout: float = 10) -> dict:
-        """发送 WS API 请求并等待响应"""
-        if not self.ws_api:
-            raise RuntimeError("WS API 未连接")
-
-        self.ws_api_id_counter += 1
-        req_id = f"req_{self.ws_api_id_counter}"
-
-        # 签名
-        params = self._sign_params(params)
-
-        payload = {
-            "id": req_id,
-            "method": method,
-            "params": {**params, "apiKey": self.config.api_key},
-        }
-
-        fut = asyncio.get_running_loop().create_future()
-        self.ws_api_responses[req_id] = fut
-
-        await self.ws_api.send(json.dumps(payload))
-
+    def _on_book_ticker(self, msg):
+        """bookTicker 回调 (SDK 返回 dict)"""
         try:
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
-            self.ws_api_responses.pop(req_id, None)
-            raise
+            if isinstance(msg, str):
+                msg = json.loads(msg)
+            # 字段可能在顶层或 data 子对象
+            data = msg.get("data", msg) if isinstance(msg, dict) else msg
+            b = data.get("b") if isinstance(data, dict) else None
+            a = data.get("a") if isinstance(data, dict) else None
+            if b and a:
+                self.bid_price = Decimal(str(b))
+                self.ask_price = Decimal(str(a))
+        except Exception as e:
+            logger.debug(f"解析 bookTicker 失败: {e}")
 
-    async def ws_place_fok_order(self, side: str, price: str, quantity: str) -> dict:
-        """WS API 下 FOK 限价单"""
-        params = {
-            "symbol": self.config.symbol,
-            "side": side,
-            "type": "LIMIT",
-            "timeInForce": "FOK",
-            "price": price,
-            "quantity": quantity,
-        }
-        resp = await self._ws_api_request("order.place", params, timeout=self.config.order_timeout)
-        return resp
+    # ==================== WS API (order_place FOK) ====================
+
+    async def init_ws_api(self):
+        """建立 WS API 连接 (SDK 自动签名 + 自动重连)"""
+        self.ws_api_conn = await self.client.websocket_api.create_connection()
+        logger.info("WS API 已连接")
+
+    async def ws_place_fok_order(self, side: str, price: Decimal, quantity: Decimal) -> dict:
+        """WS API 下 FOK 限价单
+
+        Returns:
+            {'ok': bool, 'result': Pydantic 模型, 'error_code': int, 'error_msg': str}
+        """
+        try:
+            resp = await asyncio.wait_for(
+                self.ws_api_conn.order_place(
+                    symbol=self.config.symbol,
+                    side=side,
+                    type="LIMIT",
+                    time_in_force="FOK",
+                    price=float(price),
+                    quantity=float(quantity),
+                ),
+                timeout=self.config.order_timeout,
+            )
+            data = resp.data()
+            # 检查是否是错误响应
+            err_code, err_msg = parse_ws_error(data)
+            if err_code:
+                return {"ok": False, "error_code": err_code, "error_msg": err_msg}
+            return {"ok": True, "result": data}
+        except asyncio.TimeoutError:
+            return {"ok": False, "error_code": -999, "error_msg": "timeout"}
+        except Exception as e:
+            return {"ok": False, "error_code": -1, "error_msg": str(e)}
 
     # ==================== 状态持久化 ====================
 
@@ -273,7 +199,10 @@ class InstantVolumeStrategy:
                 self.total_sell_volume = Decimal(str(state.get("global_sell_volume", 0)))
                 self.total_pnl = Decimal(str(state.get("global_pnl", 0)))
                 self.order_count = state.get("order_count", 0)
-                logger.info(f"加载状态 [{self.config.symbol}] | 买入={self.total_buy_volume} | 卖出={self.total_sell_volume}")
+                logger.info(
+                    f"加载状态 [{self.config.symbol}] | 买入={self.total_buy_volume} | "
+                    f"卖出={self.total_sell_volume}"
+                )
             except Exception as e:
                 logger.warning(f"加载状态失败: {e}")
 
@@ -292,7 +221,44 @@ class InstantVolumeStrategy:
         except Exception as e:
             logger.error(f"保存状态失败: {e}")
 
-    # ==================== 核心逻辑 ====================
+    # ==================== 响应解析 ====================
+
+    @staticmethod
+    def _get_attr(obj, *names, default=None):
+        """兼容 Pydantic 属性 / dict key 两种访问方式"""
+        for n in names:
+            if obj is None:
+                return default
+            v = getattr(obj, n, None)
+            if v is not None:
+                return v
+            if isinstance(obj, dict):
+                v = obj.get(n)
+                if v is not None:
+                    return v
+        return default
+
+    def _extract_fill_price(self, result, fallback: Decimal) -> Decimal:
+        """从订单结果提取加权成交均价 (兼容 Pydantic 和 dict)"""
+        fills = self._get_attr(result, "fills") or []
+        if fills:
+            total_qty, total_quote = Decimal("0"), Decimal("0")
+            for f in fills:
+                p = Decimal(str(self._get_attr(f, "price", default="0")))
+                q = Decimal(str(self._get_attr(f, "qty", default="0")))
+                total_quote += p * q
+                total_qty += q
+            if total_qty > 0:
+                return total_quote / total_qty
+        # fallback: price 字段
+        price = self._get_attr(result, "price")
+        if price:
+            d = Decimal(str(price))
+            if d > 0:
+                return d
+        return fallback
+
+    # ==================== 核心循环 ====================
 
     async def execute_one_cycle(self):
         """一次买卖循环"""
@@ -301,7 +267,6 @@ class InstantVolumeStrategy:
                 logger.warning("等待价格数据...")
                 return
 
-            # 价差检查
             spread = self.ask_price - self.bid_price
             max_spread = Decimal(self.config.max_spread)
             if spread > max_spread:
@@ -315,46 +280,53 @@ class InstantVolumeStrategy:
 
             # 1. FOK 买单 @ ask
             logger.info(f"下买单 | {aligned_qty} @ {buy_price} | 价差={spread}")
-            try:
-                buy_resp = await self.ws_place_fok_order("BUY", buy_price, aligned_qty)
-            except asyncio.TimeoutError:
-                logger.error("买单超时")
+            buy_resp = await self.ws_place_fok_order("BUY", buy_price, aligned_qty)
+            if not buy_resp["ok"]:
+                logger.warning(
+                    f"买单失败 | code={buy_resp['error_code']} msg={buy_resp['error_msg']}"
+                )
                 return
 
-            buy_result = buy_resp.get("result", {})
-            buy_status = buy_result.get("status", "")
+            buy_result = buy_resp["result"]
+            buy_status = self._get_attr(buy_result, "status")
             if buy_status != "FILLED":
                 logger.warning(f"买单未成交 | status={buy_status}")
                 return
 
-            # 提取买单成交信息
-            buy_fill_price = self._extract_fill_price(buy_result, Decimal(buy_price))
-            buy_fill_qty = Decimal(buy_result.get("executedQty", aligned_qty))
+            buy_fill_price = self._extract_fill_price(buy_result, buy_price)
+            buy_fill_qty = Decimal(
+                str(self._get_attr(buy_result, "executed_qty", "executedQty",
+                                   default=str(aligned_qty)))
+            )
             buy_vol = buy_fill_price * buy_fill_qty
             self.total_buy_volume += buy_vol
-
-            logger.info(f"买单成交 | {buy_fill_qty} @ {buy_fill_price} | 成交额={buy_vol:.2f}")
+            logger.info(
+                f"买单成交 | {buy_fill_qty} @ {buy_fill_price} | 成交额={buy_vol:.2f}"
+            )
 
             # 2. FOK 卖单 @ bid
             sell_qty = self._align_qty(buy_fill_qty)
             logger.info(f"下卖单 | {sell_qty} @ {sell_price}")
-            try:
-                sell_resp = await self.ws_place_fok_order("SELL", sell_price, sell_qty)
-            except asyncio.TimeoutError:
-                logger.error("卖单超时，市价清仓")
+            sell_resp = await self.ws_place_fok_order("SELL", sell_price, sell_qty)
+            if not sell_resp["ok"]:
+                logger.error(
+                    f"卖单失败 | code={sell_resp['error_code']} msg={sell_resp['error_msg']}，市价清仓"
+                )
                 await self.rest_place_market_sell(sell_qty)
                 return
 
-            sell_result = sell_resp.get("result", {})
-            sell_status = sell_result.get("status", "")
+            sell_result = sell_resp["result"]
+            sell_status = self._get_attr(sell_result, "status")
             if sell_status != "FILLED":
                 logger.warning(f"卖单未成交 | status={sell_status}，市价清仓")
                 await self.rest_place_market_sell(sell_qty)
                 return
 
-            # 提取卖单成交信息 (用实际卖出数量而非 buy_fill_qty, 因对齐可能变小)
-            sell_fill_price = self._extract_fill_price(sell_result, Decimal(sell_price))
-            sell_fill_qty = Decimal(sell_result.get("executedQty", sell_qty))
+            sell_fill_price = self._extract_fill_price(sell_result, sell_price)
+            sell_fill_qty = Decimal(
+                str(self._get_attr(sell_result, "executed_qty", "executedQty",
+                                   default=str(sell_qty)))
+            )
             sell_vol = sell_fill_price * sell_fill_qty
             pnl = (sell_fill_price - buy_fill_price) * sell_fill_qty
 
@@ -363,34 +335,23 @@ class InstantVolumeStrategy:
             self.order_count += 1
 
             pnl_str = f"+{pnl}" if pnl >= 0 else str(pnl)
-            logger.info(f"卖单成交 | {sell_fill_qty} @ {sell_fill_price} | 盈亏={pnl_str} | 累计={self.total_pnl:+.6f}")
+            logger.info(
+                f"卖单成交 | {sell_fill_qty} @ {sell_fill_price} | 盈亏={pnl_str} | "
+                f"累计={self.total_pnl:+.6f}"
+            )
 
         except Exception as e:
             logger.error(f"执行循环错误: {e}")
-
-    def _extract_fill_price(self, result: dict, fallback: Decimal) -> Decimal:
-        """从订单结果提取加权成交均价"""
-        fills = result.get("fills", [])
-        if fills:
-            total_qty, total_quote = Decimal("0"), Decimal("0")
-            for f in fills:
-                p, q = Decimal(f["price"]), Decimal(f["qty"])
-                total_quote += p * q
-                total_qty += q
-            if total_qty > 0:
-                return total_quote / total_qty
-        # fallback: 取 price 字段
-        price_str = result.get("price", "")
-        if price_str and Decimal(price_str) > 0:
-            return Decimal(price_str)
-        return fallback
 
     async def print_stats(self):
         """定时统计报告"""
         while not self.should_stop:
             await asyncio.sleep(30)
             total = self.total_buy_volume + self.total_sell_volume
-            progress = (total / (self.config.max_volume * 2) * 100) if self.config.max_volume > 0 else 0
+            progress = (
+                (total / (self.config.max_volume * 2) * 100)
+                if self.config.max_volume > 0 else 0
+            )
             logger.info(
                 f"\n{'='*70}\n"
                 f"统计报告\n"
@@ -409,7 +370,7 @@ class InstantVolumeStrategy:
             try:
                 free = await self.rest_get_balance(self.base_asset)
                 aligned = self._align_qty(free)
-                if Decimal(aligned) > 0:
+                if aligned > 0:
                     logger.info(f"清仓卖出 | {aligned} {self.base_asset}")
                     await self.rest_place_market_sell(aligned)
             except Exception as e:
@@ -427,23 +388,19 @@ class InstantVolumeStrategy:
         self.should_stop = True
 
     async def initialize(self):
-        """初始化：REST exchangeInfo + 加载状态 + 启动 WS"""
+        """初始化: REST exchangeInfo + 加载状态 + 启动 WS 连接"""
         await self.fetch_exchange_info()
         await self._load_state()
 
-        # 启动 WS Streams 和 WS API
-        asyncio.create_task(self._run_book_ticker())
-        asyncio.create_task(self._run_ws_api())
+        await self.init_ws_api()
+        await self.subscribe_book_ticker()
 
-        # 等待连接就绪
-        logger.info("等待 WS 连接...")
+        # 等待 bookTicker 第一条数据
+        logger.info("等待 BBO 数据...")
         for _ in range(30):
-            if self.ws_api and self.ask_price > 0:
+            if self.ask_price > 0:
                 break
             await asyncio.sleep(0.5)
-
-        if not self.ws_api:
-            raise RuntimeError("WS API 连接超时")
         if self.ask_price <= 0:
             logger.warning("BBO 数据未就绪，继续等待...")
 
@@ -465,8 +422,13 @@ class InstantVolumeStrategy:
             logger.error(f"策略运行错误: {e}")
         finally:
             await self._save_state()
-            if self._http_session and not self._http_session.closed:
-                await self._http_session.close()
+            # 关闭 SDK 连接
+            for conn in (self.ws_api_conn, self.ws_streams_conn):
+                if conn:
+                    try:
+                        await conn.close_connection()
+                    except Exception:
+                        pass
 
     async def shutdown(self):
         """安全退出"""
@@ -488,9 +450,6 @@ async def main():
         order_interval=cfg.get("orderInterval", 1),
         max_volume=cfg.get("maxVolume", 0),
         order_timeout=cfg.get("orderTimeout", 30),
-        api_key=os.getenv("BINANCE_API_KEY", ""),
-        api_secret=os.getenv("BINANCE_PRIVATE_KEY_PATH", ""),
-        demo=os.getenv("BINANCE_DEMO", "0") == "1",
     )
 
     logger.add(
@@ -500,14 +459,12 @@ async def main():
         level="INFO",
     )
 
-    mode = "Demo" if config.demo else "Live"
     logger.info(
         f"\n{'='*70}\n"
-        f"币安即时刷量策略\n"
+        f"币安即时刷量策略 (SDK 版)\n"
         f"策略ID: {config.strategy_id} | 交易对: {config.symbol}\n"
         f"数量: {config.quantity} | 价差上限: {config.max_spread}\n"
         f"间隔: {config.order_interval}s | 目标: {config.max_volume} USDT\n"
-        f"模式: {mode}\n"
         f"{'='*70}"
     )
 
