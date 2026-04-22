@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """策略管理工具 - 统一管理远程策略（启动、停止、查看、配置、同步、部署）"""
 
+import json
 import subprocess
 import sys
 import yaml
@@ -14,6 +15,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from openpyxl import load_workbook
 from getpass import getpass
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 MAX_RETRIES = 3
 RETRY_DELAY = 2
@@ -32,6 +39,8 @@ SSH_USER = "ubuntu"
 # SSH 密码不硬编码。可通过环境变量 SSH_PASSWORD 注入 (如 export 或 .env), 否则交互式 getpass
 DEFAULT_SSH_PASSWORD = os.getenv("SSH_PASSWORD", "")
 CONDA_ENV = "binance"
+# 部署到远程时写入 .env 的 BINANCE_DEMO 值 (从本地 .env 继承; 默认 "0" 实盘)
+DEPLOY_DEMO = os.getenv("BINANCE_DEMO", "0")
 
 STRATEGY_MAP = {
     "1": ("iv",   "instant_volume",   "即时刷量"),
@@ -49,8 +58,8 @@ CONFIG_MAP = {
 
 STRATEGY_CONFIGS = {k: (name, CONFIG_MAP[name], desc) for k, (_, name, desc) in STRATEGY_MAP.items()}
 
-# 支持热加载的策略
-HOT_RELOAD_STRATEGIES = {"market_maker_v2", "swap_volume"}
+# 支持热加载的策略 (main.py 里有 reload_hot_config_loop 或 _reload_config 监控 mtime)
+HOT_RELOAD_STRATEGIES = {"spot_volume_v2", "market_maker_v2", "swap_volume"}
 
 # 各策略字段到 YAML 路径的映射
 CONFIG_FIELD_PATHS = {
@@ -298,7 +307,7 @@ def sync_server(server, password, strategies_to_sync, rand_qty=False, rand_vol=F
     env_content = (
         f"BINANCE_API_KEY={api_key}\n"
         f"BINANCE_PRIVATE_KEY_PATH={remote_key_path}\n"
-        f"BINANCE_DEMO=0\n"
+        f"BINANCE_DEMO={DEPLOY_DEMO}\n"
     )
     with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
         f.write(env_content)
@@ -308,21 +317,29 @@ def sync_server(server, password, strategies_to_sync, rand_qty=False, rand_vol=F
     if not success:
         print(f"❌ 同步 .env 失败: {error}")
         return False
+    # 远程 .env 含凭证, 收紧权限
+    run_ssh(ip, password, f"chmod 600 {REMOTE_DIR}/.env", timeout=10)
     print(f"✅ .env 已同步")
 
-    # 上传密钥文件
+    # 上传密钥文件 + 收紧权限
     if key_path and os.path.exists(key_path):
         success, error = upload_files(ip, password, key_path, f"{REMOTE_DIR}/")
         if not success:
             print(f"⚠️  上传密钥文件失败: {error}")
+        elif remote_key_path:
+            run_ssh(ip, password, f"chmod 600 {shlex.quote(remote_key_path)}", timeout=10)
 
-    # 2. 同步策略配置
-    for step, (strategy_name, config_path, desc) in enumerate(strategies_to_sync, 2):
+    # 2. 同步策略配置 (先过滤掉本地缺失的, 再连续编号)
+    valid_strategies = [(n, p, d) for n, p, d in strategies_to_sync
+                        if (PROJECT_DIR / p).exists()]
+    missing = [d for n, p, d in strategies_to_sync if not (PROJECT_DIR / p).exists()]
+    for desc in missing:
+        print(f"⚠️  跳过 {desc}: 本地配置文件不存在")
+    total_steps = 1 + len(valid_strategies)
+
+    for step, (strategy_name, config_path, desc) in enumerate(valid_strategies, 2):
         print(f"[{step}/{total_steps}] 同步 {desc} 配置...")
         local_path = PROJECT_DIR / config_path
-        if not local_path.exists():
-            print(f"⚠️  配置文件不存在: {local_path}")
-            continue
 
         # 确保远程目录存在
         remote_dir = f"{REMOTE_DIR}/{os.path.dirname(config_path)}"
@@ -438,24 +455,38 @@ def deploy_server(server, password, full_setup=False):
     key_filename = os.path.basename(key_path) if key_path else ""
     remote_key_path = f"{REMOTE_DIR}/{key_filename}" if key_filename else ""
 
-    env_content = f"BINANCE_API_KEY={api_key}\nBINANCE_PRIVATE_KEY_PATH={remote_key_path}\nBINANCE_DEMO=0\n"
-    tmp_env = Path("/tmp") / f".env_bnc_{ip}"
-    tmp_env.write_text(env_content)
+    env_content = (
+        f"BINANCE_API_KEY={api_key}\n"
+        f"BINANCE_PRIVATE_KEY_PATH={remote_key_path}\n"
+        f"BINANCE_DEMO={DEPLOY_DEMO}\n"
+    )
+    # tempfile 默认创建 0600 权限, 避免同机其他用户读取凭证
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+        f.write(env_content)
+        tmp_env = Path(f.name)
     success, error = upload_files(ip, password, tmp_env, f"{REMOTE_DIR}/.env", retry=True)
     tmp_env.unlink(missing_ok=True)
     if not success:
         with print_lock:
             print(f"[{server_id}] ❌ 上传 .env 失败: {error}")
         return False, server, f"上传 .env 失败: {error}"
+    # 远程 .env 含凭证, 收紧权限
+    run_ssh(ip, password, f"chmod 600 {REMOTE_DIR}/.env", timeout=10)
 
-    # 上传密钥
+    # 上传密钥 + 收紧权限
     if key_path and os.path.exists(key_path):
         upload_files(ip, password, key_path, f"{REMOTE_DIR}/")
+        if remote_key_path:
+            run_ssh(ip, password, f"chmod 600 {shlex.quote(remote_key_path)}", timeout=10)
 
-    # 4. 设置执行权限
+    # 4. 设置执行权限 + 确保 screen 已安装
     with print_lock:
         print(f"[{server_id}] [4/{total_steps}] 设置执行权限...")
     run_ssh(ip, password, f"chmod +x {REMOTE_DIR}/run.sh")
+    # 非交互式尝试装 screen, 失败不阻断 (Ubuntu 预装; 其他发行版或密码 sudo 会跳过)
+    run_ssh(ip, password,
+            "command -v screen >/dev/null || sudo -n apt-get install -y screen 2>/dev/null || true",
+            timeout=30)
 
     # 5. 可选：安装 conda 环境
     if full_setup:
@@ -499,9 +530,12 @@ def start_strategy(server, mode, name, desc, password):
             return True
         run_ssh(ip, password, f'screen -S "bnc-{mode}" -X quit 2>/dev/null', timeout=5)
 
-    # 启动
+    # 启动 (screen 应在部署阶段已安装; 若未装则报错提示而非阻塞等 sudo 密码)
     launch_cmd = f"""
-command -v screen >/dev/null || sudo apt install -y screen
+if ! command -v screen >/dev/null; then
+    echo "ERROR: screen 未安装, 请在本机运行部署流程或手动 'sudo apt-get install -y screen'"
+    exit 1
+fi
 screen -dmS "bnc-{mode}" bash -c '
     source $HOME/miniconda3/etc/profile.d/conda.sh 2>/dev/null
     conda activate {CONDA_ENV} 2>/dev/null
@@ -605,12 +639,10 @@ def view_status(server, mode, name, desc, password):
 
     if success and state_stdout.strip():
         try:
-            import json
             all_state = json.loads(state_stdout)
             symbol = get_config_value(config, name, "symbol", "")
-            data = all_state.get(symbol, {})
-            if not data and all_state:
-                data = next(iter(all_state.values())) if isinstance(next(iter(all_state.values()), None), dict) else {}
+            # 精确匹配 symbol; 如果查不到不退回首个 (可能是历史遗留数据, 会误导用户)
+            data = all_state.get(symbol, {}) if symbol else {}
 
             if data:
                 buy = float(data.get('global_buy_volume', 0))
@@ -838,12 +870,7 @@ def update_config(server, mode, name, desc, password):
                     value = int(value) if '.' not in str(value) else float(value)
                 except ValueError:
                     pass
-
-        parts = key.split('.')
-        target = config
-        for p in parts[:-1]:
-            target = target.setdefault(p, {})
-        target[parts[-1]] = value
+        set_nested(config, key.split('.'), value)
 
     # 上传
     print("\n正在上传新配置...")
