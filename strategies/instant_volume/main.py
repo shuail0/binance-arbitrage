@@ -137,14 +137,13 @@ class InstantVolumeStrategy:
         logger.info(f"WS Streams 已订阅 | {self.config.symbol}@bookTicker")
 
     def _on_book_ticker(self, msg):
-        """bookTicker 回调 (SDK 返回 dict)"""
+        """bookTicker 回调 (SDK 传 Pydantic BookTickerResponse 或 dict)"""
         try:
             if isinstance(msg, str):
-                msg = json.loads(msg)
-            # 字段可能在顶层或 data 子对象
-            data = msg.get("data", msg) if isinstance(msg, dict) else msg
-            b = data.get("b") if isinstance(data, dict) else None
-            a = data.get("a") if isinstance(data, dict) else None
+                import json as _json
+                msg = _json.loads(msg)
+            b = getattr(msg, "b", None) or (msg.get("b") if isinstance(msg, dict) else None)
+            a = getattr(msg, "a", None) or (msg.get("a") if isinstance(msg, dict) else None)
             if b and a:
                 self.bid_price = Decimal(str(b))
                 self.ask_price = Decimal(str(a))
