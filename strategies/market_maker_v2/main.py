@@ -11,7 +11,6 @@ import signal
 import sys
 import time
 import uuid
-from base64 import b64encode
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,13 +18,10 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Optional
 
-import aiohttp
-import websockets
 import yaml
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
-from dotenv import load_dotenv
 from loguru import logger
+
+from strategies.common import load_credentials, make_spot_client, parse_ws_error
 
 
 # ─── 数据结构 ────────────────────────────────────────────────────────────────────
@@ -172,27 +168,13 @@ class VolatilityTracker:
 # ─── 策略主类 ────────────────────────────────────────────────────────────────────
 
 class MarketMaker:
-    def __init__(self, instrument_id: str, api_key: str, private_key_path: str, demo: bool = False):
+    def __init__(self, instrument_id: str):
         self.instrument_id = instrument_id
-        self.api_key = api_key
-        self.demo = demo
         self.should_stop = False
 
-        # 私钥
-        if not private_key_path or not os.path.exists(private_key_path):
-            raise FileNotFoundError(f"私钥文件不存在: {private_key_path}")
-        self._private_key: Ed25519PrivateKey = load_pem_private_key(
-            Path(private_key_path).read_bytes(), password=None)
-
-        # URL
-        if demo:
-            self.rest_base = "https://demo-api.binance.com"
-            self.ws_api_url = "wss://demo-ws-api.binance.com:443/ws-api/v3"
-            self.ws_stream_url = "wss://demo-stream.binance.com:9443"
-        else:
-            self.rest_base = "https://api.binance.com"
-            self.ws_api_url = "wss://ws-api.binance.com:443/ws-api/v3"
-            self.ws_stream_url = "wss://stream.binance.com:9443"
+        creds = load_credentials()
+        self.client = make_spot_client(creds, with_ws_api=True, with_ws_streams=True)
+        self.ws_api_conn = None
 
         # 市场数据
         self.bid_price = self.ask_price = Decimal("0")
@@ -220,20 +202,9 @@ class MarketMaker:
         self._csv_file = None
         self._csv_writer = None
 
-        # WS API
-        self.ws_api: Optional[websockets.WebSocketClientProtocol] = None
-        self.ws_api_responses: dict[str, asyncio.Future] = {}
-        self.ws_api_id_counter = 0
-
-        # HTTP session (持久化, 复用 TCP+TLS)
-        self._http_session: Optional[aiohttp.ClientSession] = None
-
         # 波动率
         self.vol_tracker = VolatilityTracker()
         self._vol_paused = False
-
-        # User Data Stream
-        self.listen_key: Optional[str] = None
 
         # 参数 (热加载)
         self.params: dict = {}
@@ -244,17 +215,6 @@ class MarketMaker:
         self.strategy_tasks: list = []
         self._loop_count = 0
         self._start_time = time.time()
-
-    # ─── 签名 ────────────────────────────────────────────────────────────────
-
-    def _sign(self, payload: str) -> str:
-        return b64encode(self._private_key.sign(payload.encode())).decode()
-
-    def _sign_params(self, params: dict) -> dict:
-        params["timestamp"] = str(int(time.time() * 1000))
-        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-        params["signature"] = self._sign(query)
-        return params
 
     # ─── 工具函数 ────────────────────────────────────────────────────────────
 
@@ -314,200 +274,95 @@ class MarketMaker:
         except Exception as e:
             logger.warning(f"加载参数失败: {e}")
 
-    # ─── REST ────────────────────────────────────────────────────────────────
-
-    async def _get_http_session(self) -> aiohttp.ClientSession:
-        """懒加载持久 HTTP session, 复用 TCP+TLS 连接"""
-        if self._http_session is None or self._http_session.closed:
-            self._http_session = aiohttp.ClientSession()
-        return self._http_session
-
-    async def _rest_request(self, method: str, path: str, params: dict = None, signed: bool = False) -> dict:
-        url = f"{self.rest_base}{path}"
-        headers = {"X-MBX-APIKEY": self.api_key}
-        params = params or {}
-        if signed:
-            params = self._sign_params(params)
-        session = await self._get_http_session()
-        async with session.request(method, url, params=params, headers=headers) as resp:
-            return await resp.json()
+    # ─── REST (SDK) ──────────────────────────────────────────────────────────
 
     async def _fetch_exchange_info(self):
-        data = await self._rest_request("GET", "/api/v3/exchangeInfo", {"symbol": self.instrument_id})
-        if not data.get("symbols"):
+        resp = await asyncio.to_thread(self.client.rest_api.exchange_info, symbol=self.instrument_id)
+        data = resp.data()
+        if not data.symbols:
             raise RuntimeError(f"交易对 {self.instrument_id} 未找到")
-        sym = data["symbols"][0]
-        self.base_asset = sym["baseAsset"]
-        self.quote_asset = sym["quoteAsset"]
-        for f in sym["filters"]:
-            if f["filterType"] == "PRICE_FILTER":
-                self.tick_size = Decimal(f["tickSize"])
-            elif f["filterType"] == "LOT_SIZE":
-                self.step_size = Decimal(f["stepSize"])
-            elif f["filterType"] == "NOTIONAL":
-                self.min_notional = Decimal(f.get("minNotional", "5"))
+        sym = data.symbols[0]
+        self.base_asset = sym.base_asset
+        self.quote_asset = sym.quote_asset
+        for f in sym.filters:
+            ft = getattr(f, "filter_type", None) or getattr(f, "filterType", None)
+            if ft == "PRICE_FILTER":
+                self.tick_size = Decimal(str(f.tick_size))
+            elif ft == "LOT_SIZE":
+                self.step_size = Decimal(str(f.step_size))
+            elif ft == "NOTIONAL":
+                mn = getattr(f, "min_notional", None) or getattr(f, "minNotional", None)
+                if mn:
+                    self.min_notional = Decimal(str(mn))
         logger.info(f"交易规则 | {self.instrument_id} | base={self.base_asset} quote={self.quote_asset} | "
                     f"tick={self.tick_size} | step={self.step_size} | minNotional={self.min_notional}")
 
-    async def _rest_get_account(self) -> dict:
-        return await self._rest_request("GET", "/api/v3/account", signed=True)
-
     async def _rest_get_balance(self, asset: str) -> tuple[Decimal, Decimal]:
         """返回 (free, locked)"""
-        data = await self._rest_get_account()
-        for b in data.get("balances", []):
-            if b["asset"] == asset:
-                return Decimal(b["free"]), Decimal(b.get("locked", "0"))
+        resp = await asyncio.to_thread(self.client.rest_api.get_account)
+        data = resp.data()
+        for b in data.balances or []:
+            if b.asset == asset:
+                return Decimal(str(b.free or "0")), Decimal(str(b.locked or "0"))
         return Decimal("0"), Decimal("0")
 
     async def _rest_place_market_sell(self, qty: str) -> dict:
-        return await self._rest_request("POST", "/api/v3/order", {
-            "symbol": self.instrument_id, "side": "SELL", "type": "MARKET", "quantity": qty,
-        }, signed=True)
+        try:
+            resp = await asyncio.to_thread(
+                self.client.rest_api.new_order,
+                symbol=self.instrument_id, side="SELL", type="MARKET", quantity=float(qty),
+            )
+            data = resp.data()
+            return {"orderId": getattr(data, "order_id", None)}
+        except Exception as e:
+            logger.error(f"市价卖出失败: {e}")
+            return {}
 
     async def _rest_cancel_open_orders(self):
-        return await self._rest_request("DELETE", "/api/v3/openOrders", {
-            "symbol": self.instrument_id,
-        }, signed=True)
+        try:
+            await asyncio.to_thread(self.client.rest_api.delete_open_orders, symbol=self.instrument_id)
+        except Exception as e:
+            logger.warning(f"REST 批量撤单失败: {e}")
 
     async def _rest_get_open_orders(self) -> list:
-        data = await self._rest_request("GET", "/api/v3/openOrders", {
-            "symbol": self.instrument_id,
-        }, signed=True)
-        return data if isinstance(data, list) else []
-
-    # ─── Listen Key ──────────────────────────────────────────────────────────
-
-    async def _get_listen_key(self) -> str:
-        data = await self._rest_request("POST", "/api/v3/userDataStream", signed=False)
-        return data["listenKey"]
-
-    async def _keepalive_listen_key_loop(self):
-        while not self.should_stop:
-            try:
-                await asyncio.sleep(30 * 60)
-                if self.listen_key:
-                    await self._rest_request("PUT", "/api/v3/userDataStream", {"listenKey": self.listen_key})
-                    logger.debug("listenKey keepalive 完成")
-            except Exception as e:
-                logger.warning(f"listenKey keepalive 失败: {e}")
-
-    # ─── WS Streams ──────────────────────────────────────────────────────────
-
-    async def _run_market_streams(self):
-        """bookTicker + depth5@100ms + ticker"""
-        sym = self.instrument_id.lower()
-        url = f"{self.ws_stream_url}/stream?streams={sym}@bookTicker/{sym}@depth5@100ms/{sym}@ticker"
-        while not self.should_stop:
-            try:
-                async with websockets.connect(url, ping_interval=20) as ws:
-                    logger.info("WS Streams 已连接 | bookTicker + depth5 + ticker")
-                    async for raw in ws:
-                        if self.should_stop:
-                            break
-                        msg = json.loads(raw)
-                        data = msg.get("data", msg)
-                        stream = msg.get("stream", "")
-                        if "bookTicker" in stream:
-                            self.bid_price = Decimal(data["b"])
-                            self.ask_price = Decimal(data["a"])
-                        elif "depth5" in stream:
-                            self.depth_bids = data.get("bids", [])
-                            self.depth_asks = data.get("asks", [])
-                        elif "ticker" in stream:
-                            last = float(data.get("c", 0))
-                            if last > 0:
-                                self.vol_tracker.on_price(last)
-            except (websockets.ConnectionClosed, Exception) as e:
-                if self.should_stop:
-                    break
-                logger.warning(f"WS Streams 断线: {e}，3秒后重连...")
-                await asyncio.sleep(3)
-
-    async def _run_user_data_stream(self):
-        while not self.should_stop:
-            try:
-                self.listen_key = await self._get_listen_key()
-                url = f"{self.ws_stream_url}/ws/{self.listen_key}"
-                async with websockets.connect(url, ping_interval=20) as ws:
-                    logger.info("User Data Stream 已连接")
-                    async for raw in ws:
-                        if self.should_stop:
-                            break
-                        msg = json.loads(raw)
-                        if msg.get("e") == "executionReport":
-                            asyncio.create_task(self._handle_execution_report(msg))
-                        elif msg.get("e") == "outboundAccountPosition":
-                            self._handle_account_update(msg)
-            except (websockets.ConnectionClosed, Exception) as e:
-                if self.should_stop:
-                    break
-                logger.warning(f"User Data Stream 断线: {e}，3秒后重连...")
-                await asyncio.sleep(3)
-
-    def _handle_account_update(self, msg: dict):
-        """outboundAccountPosition 更新可用余额"""
-        for b in msg.get("B", []):
-            if b.get("a") == self.base_asset:
-                free = Decimal(b.get("f", "0"))
-                locked = Decimal(b.get("l", "0"))
-                self.available_qty = free + locked
-
-    # ─── WS API ──────────────────────────────────────────────────────────────
-
-    async def _run_ws_api(self):
-        while not self.should_stop:
-            try:
-                async with websockets.connect(self.ws_api_url, ping_interval=20, max_size=2**22) as ws:
-                    self.ws_api = ws
-                    logger.info("WS API 已连接")
-                    async for raw in ws:
-                        if self.should_stop:
-                            break
-                        msg = json.loads(raw)
-                        req_id = msg.get("id")
-                        if req_id and req_id in self.ws_api_responses:
-                            fut = self.ws_api_responses.pop(req_id)
-                            if not fut.done():
-                                fut.set_result(msg)
-            except (websockets.ConnectionClosed, Exception) as e:
-                if self.should_stop:
-                    break
-                self.ws_api = None
-                logger.warning(f"WS API 断线: {e}，3秒后重连...")
-                await asyncio.sleep(3)
-
-    async def _ws_api_request(self, method: str, params: dict, timeout: float = 10) -> dict:
-        if not self.ws_api:
-            raise RuntimeError("WS API 未连接")
-        self.ws_api_id_counter += 1
-        req_id = f"req_{self.ws_api_id_counter}"
-        params = self._sign_params(params)
-        payload = {"id": req_id, "method": method, "params": {**params, "apiKey": self.api_key}}
-        fut = asyncio.get_running_loop().create_future()
-        self.ws_api_responses[req_id] = fut
-        await self.ws_api.send(json.dumps(payload))
         try:
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
-            self.ws_api_responses.pop(req_id, None)
-            raise
+            resp = await asyncio.to_thread(self.client.rest_api.get_open_orders, symbol=self.instrument_id)
+            orders = resp.data()
+            if not isinstance(orders, list):
+                return []
+            return [{"orderId": str(getattr(o, "order_id", "") or ""),
+                     "clientOrderId": str(getattr(o, "client_order_id", "") or "")}
+                    for o in orders]
+        except Exception as e:
+            logger.warning(f"获取挂单失败: {e}")
+            return []
 
-    # ─── 下单/撤单 ──────────────────────────────────────────────────────────
+    # ─── WS API (SDK) ───────────────────────────────────────────────────────
+
+    async def _init_ws_api(self):
+        self.ws_api_conn = await self.client.websocket_api.create_connection()
+        await self.ws_api_conn.session_logon()
+        logger.info("WS API 已连接并认证")
 
     async def _place_order(self, side: str, price: Decimal, qty: Decimal, cl_ord_id: str) -> Optional[dict]:
-        params = {
-            "symbol": self.instrument_id,
-            "side": side,
-            "type": "LIMIT",
-            "timeInForce": "GTC",
-            "quantity": self._qty_str(qty),
-            "price": self._price_str(price),
-            "newClientOrderId": cl_ord_id,
-        }
         try:
-            resp = await self._ws_api_request("order.place", params)
-            return resp
+            resp = await asyncio.wait_for(
+                self.ws_api_conn.order_place(
+                    symbol=self.instrument_id,
+                    side=side,
+                    type="LIMIT",
+                    time_in_force="GTC",
+                    quantity=float(qty),
+                    price=float(price),
+                    new_client_order_id=cl_ord_id,
+                ),
+                timeout=10,
+            )
+            data = resp.data()
+            result = data.result
+            if result is None:
+                return None
+            return {"result": {"orderId": str(result.order_id), "status": result.status}}
         except asyncio.TimeoutError:
             logger.warning(f"下单超时 | {cl_ord_id}")
             return None
@@ -516,18 +371,24 @@ class MarketMaker:
             return None
 
     async def _cancel_order(self, order: ActiveOrder) -> bool:
-        params = {"symbol": self.instrument_id}
-        if order.order_id:
-            params["orderId"] = order.order_id
-        else:
-            params["origClientOrderId"] = order.cl_ord_id
         try:
-            resp = await self._ws_api_request("order.cancel", params, timeout=5)
-            return resp.get("status") != -1
+            resp = await asyncio.wait_for(
+                self.ws_api_conn.order_cancel(
+                    symbol=self.instrument_id,
+                    order_id=int(order.order_id) if order.order_id else None,
+                    orig_client_order_id=order.cl_ord_id if not order.order_id else None,
+                ),
+                timeout=5,
+            )
+            resp.data()
+            return True
         except asyncio.TimeoutError:
             logger.warning(f"撤单超时 | {self._short_id(order.cl_ord_id)}")
             return False
         except Exception as e:
+            err_code, _ = parse_ws_error({"error": str(e)})
+            if err_code == -2011:  # 订单已成交/撤/不存在，视为成功
+                return True
             logger.warning(f"撤单异常 | {self._short_id(order.cl_ord_id)} | {e}")
             return False
 
@@ -536,36 +397,104 @@ class MarketMaker:
         orders_to_cancel = [o for o in self.orders.values() if not o.pending]
         if not orders_to_cancel:
             return
-        tasks = [self._cancel_order(o) for o in orders_to_cancel]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*[self._cancel_order(o) for o in orders_to_cancel], return_exceptions=True)
 
     async def _cancel_all_rest(self):
         """REST 批量撤单兜底"""
+        await self._rest_cancel_open_orders()
+        logger.info("REST 批量撤单完成")
+
+    # ─── WS Streams (SDK) ───────────────────────────────────────────────────
+
+    def _on_book_ticker(self, msg):
         try:
-            await self._rest_cancel_open_orders()
-            logger.info("REST 批量撤单完成")
+            b = getattr(msg, "b", None) or (msg.get("b") if isinstance(msg, dict) else None)
+            a = getattr(msg, "a", None) or (msg.get("a") if isinstance(msg, dict) else None)
+            if b and a:
+                self.bid_price = Decimal(str(b))
+                self.ask_price = Decimal(str(a))
         except Exception as e:
-            logger.warning(f"REST 批量撤单失败: {e}")
+            logger.debug(f"解析 bookTicker 失败: {e}")
+
+    def _on_depth(self, msg):
+        try:
+            bids = getattr(msg, "bids", None) or (msg.get("bids") if isinstance(msg, dict) else None)
+            asks = getattr(msg, "asks", None) or (msg.get("asks") if isinstance(msg, dict) else None)
+            if bids is not None:
+                self.depth_bids = bids
+            if asks is not None:
+                self.depth_asks = asks
+        except Exception as e:
+            logger.debug(f"解析 depth 失败: {e}")
+
+    def _on_ticker(self, msg):
+        try:
+            c = getattr(msg, "c", None) or (msg.get("c") if isinstance(msg, dict) else None)
+            if c:
+                last = float(c)
+                if last > 0:
+                    self.vol_tracker.on_price(last)
+        except Exception as e:
+            logger.debug(f"解析 ticker 失败: {e}")
+
+    async def _init_ws_streams(self):
+        sym = self.instrument_id.lower()
+        await self.client.websocket_streams.create_connection()
+        h1 = await self.client.websocket_streams.book_ticker(symbol=sym)
+        h1.on("message", self._on_book_ticker)
+        h2 = await self.client.websocket_streams.partial_book_depth(sym, 5, update_speed="100ms")
+        h2.on("message", self._on_depth)
+        h3 = await self.client.websocket_streams.ticker(symbol=sym)
+        h3.on("message", self._on_ticker)
+        logger.info(f"WS Streams 已订阅 | {self.instrument_id}@bookTicker + @depth5 + @ticker")
+
+    # ─── User Data Stream (SDK via WS API) ──────────────────────────────────
+
+    def _on_user_data(self, event):
+        try:
+            from binance_sdk_spot.websocket_api.models import ExecutionReport, OutboundAccountPosition
+            actual = getattr(event, "actual_instance", event)
+            if isinstance(actual, ExecutionReport):
+                asyncio.create_task(self._handle_execution_report(actual))
+            elif isinstance(actual, OutboundAccountPosition):
+                self._handle_account_update(actual)
+        except Exception as e:
+            logger.error(f"处理 UserData 回调失败: {e}")
+
+    async def _init_user_data_stream(self):
+        result = await self.ws_api_conn.user_data_stream_subscribe_signature()
+        result.stream.on("message", self._on_user_data)
+        logger.info("User Data Stream 已订阅 (WS API session)")
+
+    def _handle_account_update(self, msg):
+        """outboundAccountPosition 更新可用余额 (SDK Pydantic OutboundAccountPosition)"""
+        balances = getattr(msg, "B", None) or []
+        for b in balances:
+            if getattr(b, "a", None) == self.base_asset:
+                free = self._safe_decimal(getattr(b, "f", None))
+                locked = self._safe_decimal(getattr(b, "l", None))
+                self.available_qty = free + locked
 
     # ─── executionReport 处理 ────────────────────────────────────────────────
 
-    async def _handle_execution_report(self, msg: dict):
+    async def _handle_execution_report(self, msg):
+        """处理 ExecutionReport Pydantic 模型 (字段名单字母)"""
         try:
-            symbol = msg.get("s", "")
+            symbol = getattr(msg, "s", "") or ""
             if symbol != self.instrument_id:
                 return
 
-            cl_ord_id = msg.get("c", "")
-            order_id = str(msg.get("i", ""))
-            exec_type = msg.get("x", "")       # NEW / TRADE / CANCELED / EXPIRED
-            order_status = msg.get("X", "")     # NEW / PARTIALLY_FILLED / FILLED / CANCELED
-            side = msg.get("S", "")             # BUY / SELL
-            cum_filled_qty = self._safe_decimal(msg.get("z"))
-            last_filled_price = self._safe_decimal(msg.get("L"))
-            last_filled_qty = self._safe_decimal(msg.get("l"))
-            commission = self._safe_decimal(msg.get("n"))
-            commission_asset = msg.get("N", "")
-            cum_quote_qty = self._safe_decimal(msg.get("Z"))
+            cl_ord_id = getattr(msg, "c", "") or ""
+            order_id = str(getattr(msg, "i", "") or "")
+            exec_type = getattr(msg, "x", "") or ""       # NEW / TRADE / CANCELED / EXPIRED
+            order_status = getattr(msg, "X", "") or ""     # NEW / PARTIALLY_FILLED / FILLED / CANCELED
+            side = getattr(msg, "S", "") or ""             # BUY / SELL
+            cum_filled_qty = self._safe_decimal(getattr(msg, "z", None))
+            last_filled_price = self._safe_decimal(getattr(msg, "L", None))
+            last_filled_qty = self._safe_decimal(getattr(msg, "l", None))
+            commission = self._safe_decimal(getattr(msg, "n", None))
+            commission_asset = getattr(msg, "N", "") or ""
+            cum_quote_qty = self._safe_decimal(getattr(msg, "Z", None))
 
             order = self.orders.get(cl_ord_id)
 
@@ -595,7 +524,6 @@ class MarketMaker:
             if order_status in ("FILLED", "CANCELED", "EXPIRED"):
                 order.filled_qty = cum_filled_qty
                 order.pending = False
-                # 终态统计
                 if cum_filled_qty > 0:
                     vol = cum_quote_qty
                     fee_info = f"{order.cum_fee} {order.fee_ccy}" if order.cum_fee > 0 else ""
@@ -605,9 +533,7 @@ class MarketMaker:
                                     f"price={cum_quote_qty / cum_filled_qty if cum_filled_qty else 0:.6f} | "
                                     f"qty={cum_filled_qty} | amount={vol:.2f} | {fee_info}")
                     else:
-                        # 卖单盈亏用现金流法
-                        pnl = Decimal("0")  # 单笔pnl在总P&L中体现
-                        self.stats.add(sell_vol=vol, pnl=pnl, fee=order.cum_fee, fee_ccy=order.fee_ccy)
+                        self.stats.add(sell_vol=vol, pnl=Decimal("0"), fee=order.cum_fee, fee_ccy=order.fee_ccy)
                         logger.info(f"[#{self._short_id(cl_ord_id)}] 卖单{order_status} | "
                                     f"price={cum_quote_qty / cum_filled_qty if cum_filled_qty else 0:.6f} | "
                                     f"qty={cum_filled_qty} | amount={vol:.2f} | {fee_info}")
@@ -620,13 +546,11 @@ class MarketMaker:
 
     def _update_position(self, order: ActiveOrder, fill_qty: Decimal, fill_price: Decimal,
                          commission: Decimal, commission_asset: str, cum_quote_qty: Decimal, cum_filled_qty: Decimal):
-        """更新净持仓和统计"""
         fee_incr = max(commission - order.cum_fee, Decimal("0"))
         order.cum_fee = commission
         order.fee_ccy = commission_asset
 
         actual_qty = fill_qty
-        # 现货买入时 base 扣手续费
         if order.side == "BUY" and fee_incr > 0 and commission_asset == self.base_asset:
             actual_qty = max(fill_qty - fee_incr, Decimal("0"))
 
@@ -649,7 +573,6 @@ class MarketMaker:
         return realized, unrealized, realized + unrealized
 
     def _can_profitable_exit(self) -> bool:
-        """现金流法: 如果全部按ask卖出能盈利"""
         if self.net_filled_qty <= 0 or self.ask_price <= 0:
             return False
         realized = self.sell_volume - self.buy_volume
@@ -658,7 +581,6 @@ class MarketMaker:
     # ─── OBI 计算 ────────────────────────────────────────────────────────────
 
     def _calc_imbalance(self, depth: int = 5) -> float:
-        """前N档 bid/ask 量比，>1偏多头，<1偏空头"""
         bid_vol = sum(float(b[1]) for b in self.depth_bids[:depth]) if self.depth_bids else 0
         ask_vol = sum(float(a[1]) for a in self.depth_asks[:depth]) if self.depth_asks else 0
         return bid_vol / ask_vol if ask_vol > 0 else 1.0
@@ -666,7 +588,6 @@ class MarketMaker:
     # ─── 网格计算 + Diff ────────────────────────────────────────────────────
 
     def _decide_orders(self) -> tuple[list[TargetOrder], list[TargetOrder]]:
-        """计算目标买卖网格，返回 (target_buys, target_sells)"""
         if self.bid_price <= 0 or self.ask_price <= 0:
             return [], []
 
@@ -718,19 +639,16 @@ class MarketMaker:
         # 卖侧网格
         target_sells = []
         if exit_all and self.net_filled_qty > 0:
-            # 加速出货: 集中挂卖一
             sell_px = self._align_price(self.ask_price + step * start_level, "SELL")
             sell_qty = self._align_qty(min(self.net_filled_qty, self.available_qty))
             if sell_qty >= self.step_size and self._check_min_notional(sell_qty, sell_px):
                 target_sells.append(TargetOrder(side="SELL", price=sell_px, quantity=sell_qty))
         else:
             remaining_avail = self.available_qty
-            # 扣除已挂卖单的冻结量 (available_qty 已含 locked)
             for i in range(sell_levels):
                 level = i + start_level
                 px = self._align_price(self.ask_price + step * level, "SELL")
                 qty = self._align_qty(single_size * (1 + size_growth * i))
-                # 卖单不超过可用余额
                 qty = min(qty, self._align_qty(remaining_avail))
                 if qty < self.step_size or not self._check_min_notional(qty, px):
                     break
@@ -747,17 +665,13 @@ class MarketMaker:
         Pass 1: 精确匹配 (price + remaining qty) → 保留
         Pass 2: 剩余 current → 全部撤单
         Pass 3: 剩余 proposed → 全部新下单
-        返回 (to_place, to_cancel)
         """
         current = [o for o in self.orders.values() if o.side == side and not o.pending]
-
-        # Pass 1: 精确匹配
         proposed_copy = list(proposed)
         matched_current = set()
         matched_proposed = set()
         for ci, cur in enumerate(current):
-            remaining = cur.quantity - cur.filled_qty
-            remaining = self._align_qty(remaining)
+            remaining = self._align_qty(cur.quantity - cur.filled_qty)
             for pi, prop in enumerate(proposed_copy):
                 if pi in matched_proposed:
                     continue
@@ -765,11 +679,8 @@ class MarketMaker:
                     matched_current.add(ci)
                     matched_proposed.add(pi)
                     break
-
-        # Pass 2 + 3
         to_cancel = [cur for ci, cur in enumerate(current) if ci not in matched_current]
         to_place = [prop for pi, prop in enumerate(proposed_copy) if pi not in matched_proposed]
-
         return to_place, to_cancel
 
     # ─── 策略主循环 ─────────────────────────────────────────────────────────
@@ -781,19 +692,16 @@ class MarketMaker:
                 self._load_params()
                 loop_interval = float(self.params.get("loop_interval", 0.5))
 
-                # 最大成交额检查
                 max_vol = float(self.params.get("max_volume", 0))
                 if self.stats.is_max_reached(max_vol):
                     logger.warning(f"累计成交额达到上限: {max_vol}, 触发退出")
                     os.kill(os.getpid(), signal.SIGINT)
                     break
 
-                # 等待 BBO
                 if self.bid_price <= 0 or self.ask_price <= 0:
                     await asyncio.sleep(1)
                     continue
 
-                # 波动率熔断
                 if self.params.get("vol_enabled", True):
                     self._check_volatility()
                     if self._vol_paused:
@@ -803,15 +711,9 @@ class MarketMaker:
                     self._vol_paused = False
                     logger.info("波动率熔断已关闭(vol_enabled=false)，恢复运行")
 
-                # 计算目标
                 target_buys, target_sells = self._decide_orders()
-
-                # Diff 买侧
                 buy_place, buy_cancel = self._diff_orders(target_buys, "BUY")
-                # Diff 卖侧
                 sell_place, sell_cancel = self._diff_orders(target_sells, "SELL")
-
-                # 先撤后下
                 all_cancel = buy_cancel + sell_cancel
                 all_place = buy_place + sell_place
 
@@ -823,10 +725,8 @@ class MarketMaker:
                     results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
                     for order, result in zip(all_cancel, results):
                         if result is True:
-                            # 撤单成功, 从本地移除
                             self.orders.pop(order.cl_ord_id, None)
                         else:
-                            # 撤单失败或异常: 保留订单, 清 pending 以便下轮重试撤单
                             order.pending = False
 
                 if all_place:
@@ -835,12 +735,11 @@ class MarketMaker:
                     for target in all_place:
                         cid = self._new_cid()
                         place_cids.append(cid)
-                        order = ActiveOrder(
+                        self.orders[cid] = ActiveOrder(
                             cl_ord_id=cid, order_id="", side=target.side,
                             price=target.price, quantity=target.quantity,
                             pending=True, sent_at=time.time(),
                         )
-                        self.orders[cid] = order
                         place_tasks.append(self._place_order(target.side, target.price, target.quantity, cid))
                     results = await asyncio.gather(*place_tasks, return_exceptions=True)
                     for cid, target, result in zip(place_cids, all_place, results):
@@ -853,7 +752,8 @@ class MarketMaker:
                                 self.orders[cid].pending = False
                             elif result.get("error"):
                                 err = result["error"]
-                                logger.debug(f"下单跳过 | {target.side} {target.quantity}@{target.price} | {err.get('msg', err)}")
+                                logger.debug(f"下单跳过 | {target.side} {target.quantity}@{target.price} | "
+                                             f"{err.get('msg', err) if isinstance(err, dict) else err}")
                                 self.orders.pop(cid, None)
 
                 if all_cancel or all_place:
@@ -908,13 +808,11 @@ class MarketMaker:
             logger.info(f"波动率熔断解除: {ratio:.1f}x基准, 振幅{range_pct:.6f}")
 
     async def _volatility_close_all(self):
-        """熔断: 撤单 + 可选市价清仓"""
         try:
             await self._cancel_all_rest()
         except Exception as e:
             logger.warning(f"熔断撤单失败: {e}")
         self.orders.clear()
-
         if self.params.get("vol_close_on_pause", False):
             await self._market_close_rest()
 
@@ -922,7 +820,7 @@ class MarketMaker:
         """REST 查余额 → 市价清仓"""
         for attempt in range(5):
             try:
-                free, locked = await self._rest_get_balance(self.base_asset)
+                free, _ = await self._rest_get_balance(self.base_asset)
                 avail = free
             except Exception as e:
                 logger.warning(f"清仓查余额失败: {e}")
@@ -940,7 +838,6 @@ class MarketMaker:
 
             logger.info(f"清仓: {qty} {self.base_asset} (attempt {attempt + 1})")
             try:
-                cid = f"lq{uuid.uuid4().hex[:16]}"
                 result = await self._rest_place_market_sell(self._qty_str(qty))
                 if result.get("orderId"):
                     logger.info(f"清仓成功 | orderId={result['orderId']}")
@@ -955,7 +852,6 @@ class MarketMaker:
     # ─── 订单校准 ────────────────────────────────────────────────────────────
 
     async def _reconcile_orders(self):
-        """REST 查询真实挂单，清理本地幽灵订单"""
         try:
             exchange_orders = await self._rest_get_open_orders()
             exchange_ids = {str(o["orderId"]) for o in exchange_orders}
@@ -977,16 +873,12 @@ class MarketMaker:
     # ─── REST 轮询 (余额校准) ───────────────────────────────────────────────
 
     async def _rest_polling_loop(self):
-        """定期获取余额 + 订单校准"""
         while not self.should_stop:
             try:
                 free, locked = await self._rest_get_balance(self.base_asset)
                 self.available_qty = free + locked
-
-                # 每 5 分钟对账一次
                 if self._loop_count % 600 == 0:
                     await self._reconcile_orders()
-
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1039,7 +931,6 @@ class MarketMaker:
             await asyncio.sleep(30)
             if self.bid_price > 0:
                 _no_bbo_count = 0
-                # 清理超时的 pending 订单
                 stale_pending = [cid for cid, o in self.orders.items()
                                  if o.pending and time.time() - o.sent_at > 30]
                 for cid in stale_pending:
@@ -1108,7 +999,6 @@ class MarketMaker:
             logger.warning(f"恢复状态失败: {e}")
 
     async def _reconcile_position(self):
-        """启动时对齐净持仓与真实余额"""
         if not self.base_asset:
             return
         try:
@@ -1137,21 +1027,16 @@ class MarketMaker:
         await self._reconcile_position()
         self._init_trade_csv()
 
-        # 启动 WS
-        asyncio.create_task(self._run_market_streams())
-        asyncio.create_task(self._run_ws_api())
-        asyncio.create_task(self._run_user_data_stream())
-        asyncio.create_task(self._keepalive_listen_key_loop())
+        await self._init_ws_api()
+        await self._init_ws_streams()
+        await self._init_user_data_stream()
 
-        # 等待连接就绪
-        logger.info("等待 WS 连接...")
+        logger.info("等待 BBO 数据...")
         for _ in range(30):
-            if self.ws_api and self.bid_price > 0:
+            if self.bid_price > 0:
                 break
             await asyncio.sleep(0.5)
 
-        if not self.ws_api:
-            raise RuntimeError("WS API 连接超时")
         if self.bid_price <= 0:
             logger.warning("BBO 数据未就绪，继续等待...")
 
@@ -1187,7 +1072,6 @@ class MarketMaker:
     async def shutdown(self):
         logger.info("正在关闭策略...")
 
-        # 1. 撤销所有挂单
         try:
             await self._cancel_all_rest()
         except Exception as e:
@@ -1195,24 +1079,27 @@ class MarketMaker:
         self.orders.clear()
         await asyncio.sleep(0.5)
 
-        # 2. 清仓
         if self.params.get("auto_close_on_exit", False):
             await self._market_close_rest()
 
-        # 3. 保存状态
         try:
             self._save_state()
             self.stats.save()
         except Exception as e:
             logger.warning(f"保存统计失败: {e}")
 
-        # 4. 关闭 CSV
         if self._csv_file:
             self._csv_file.close()
 
-        # 5. 关闭 HTTP session
-        if self._http_session and not self._http_session.closed:
-            await self._http_session.close()
+        try:
+            if self.ws_api_conn:
+                await self.ws_api_conn.close()
+        except Exception:
+            pass
+        try:
+            await self.client.websocket_streams.close()
+        except Exception:
+            pass
 
         logger.info("策略已安全关闭")
 
@@ -1232,28 +1119,19 @@ def setup_logger(instrument_id: str):
 
 def handle_exception(_loop, context):
     msg = context.get("exception", context["message"])
-    if "ConnectionClosed" in str(msg) or "no close frame" in str(msg):
-        return
     logger.error(f"未捕获的异步异常: {msg}", exc_info=context.get("exception"))
 
 
 async def main():
-    load_dotenv()
-
     params_path = Path(__file__).parent / "params.yaml"
     with open(params_path) as f:
         root_params = yaml.safe_load(f)
 
     instrument_id = root_params.get("instrument_id", "XAUTUSDT")
-    api_key = os.getenv("BINANCE_API_KEY", "")
-    private_key_path = os.getenv("BINANCE_PRIVATE_KEY_PATH", "")
-    demo = os.getenv("BINANCE_DEMO", "0") == "1"
-    assert api_key and private_key_path, "请在 .env 中配置 BINANCE_API_KEY 和 BINANCE_PRIVATE_KEY_PATH"
-
     setup_logger(instrument_id)
     asyncio.get_running_loop().set_exception_handler(handle_exception)
 
-    mm = MarketMaker(instrument_id, api_key, private_key_path, demo)
+    mm = MarketMaker(instrument_id)
 
     def signal_handler(_sig, _frame):
         logger.warning("收到停止信号, 正在安全退出...")
@@ -1264,12 +1142,11 @@ async def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    mode = "Demo" if demo else "Live"
     strategy_params = root_params.get("strategy", {})
     logger.info(
         f"\n{'='*70}\n"
         f"币安现货双向做市策略V2\n"
-        f"交易对: {instrument_id} | 模式: {mode}\n"
+        f"交易对: {instrument_id}\n"
         f"网格: step={strategy_params.get('step')} levels={strategy_params.get('num_of_order_each_side')} "
         f"size={strategy_params.get('single_size')} growth={strategy_params.get('size_growth_factor')}\n"
         f"库存限制: buy={strategy_params.get('maximum_net_buy')} sell={strategy_params.get('maximum_net_sell')}\n"
