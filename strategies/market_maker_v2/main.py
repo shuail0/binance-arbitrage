@@ -312,7 +312,7 @@ class MarketMaker:
         try:
             resp = await asyncio.to_thread(
                 self.client.rest_api.new_order,
-                symbol=self.instrument_id, side="SELL", type="MARKET", quantity=float(qty),
+                symbol=self.instrument_id, side="SELL", type="MARKET", quantity=str(qty),
             )
             data = resp.data()
             return {"orderId": getattr(data, "order_id", None)}
@@ -354,8 +354,8 @@ class MarketMaker:
                     side=side,
                     type="LIMIT",
                     time_in_force="GTC",
-                    quantity=float(qty),
-                    price=float(price),
+                    quantity=str(qty),
+                    price=str(price),
                     new_client_order_id=cl_ord_id,
                 ),
                 timeout=10,
@@ -377,7 +377,7 @@ class MarketMaker:
             resp = await asyncio.wait_for(
                 self.ws_api_conn.order_cancel(
                     symbol=self.instrument_id,
-                    order_id=int(order.order_id) if order.order_id else None,
+                    order_id=order.order_id if order.order_id else None,
                     orig_client_order_id=order.cl_ord_id if not order.order_id else None,
                 ),
                 timeout=5,

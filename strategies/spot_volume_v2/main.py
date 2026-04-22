@@ -336,7 +336,7 @@ class SpotVolumeV2:
         try:
             resp = await asyncio.to_thread(
                 self.client.rest_api.new_order,
-                symbol=self.config.symbol, side="SELL", type="MARKET", quantity=float(qty),
+                symbol=self.config.symbol, side="SELL", type="MARKET", quantity=str(qty),
             )
             data = resp.data()
             order_id = getattr(data, "order_id", None)
@@ -370,8 +370,8 @@ class SpotVolumeV2:
                     symbol=self.config.symbol,
                     side=side,
                     type=ord_type,
-                    quantity=float(quantity),
-                    price=float(price) if price else None,
+                    quantity=str(quantity),
+                    price=str(price) if price else None,
                     new_client_order_id=client_order_id,
                     time_in_force=tif,
                 ),

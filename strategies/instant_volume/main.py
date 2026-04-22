@@ -119,7 +119,7 @@ class InstantVolumeStrategy:
                 symbol=self.config.symbol,
                 side="SELL",
                 type="MARKET",
-                quantity=float(qty),
+                quantity=str(qty),
             )
             result = resp.data()
             order_id = getattr(result, "order_id", None) or getattr(result, "orderId", None)
@@ -170,8 +170,8 @@ class InstantVolumeStrategy:
                     side=side,
                     type="LIMIT",
                     time_in_force="FOK",
-                    price=float(price),
-                    quantity=float(quantity),
+                    price=str(price),
+                    quantity=str(quantity),
                 ),
                 timeout=self.config.order_timeout,
             )
