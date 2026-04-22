@@ -236,6 +236,7 @@ class SwapVolume:
         self._config_path = Path(__file__).parent / "config.yaml"
         self._current_leverage = 0
         self.strategy_tasks: list = []
+        self._cycle_running = False   # 防止 _execute_cycle 并发
 
     # ─── 工具函数 ─────────────────────────────────────────────────────────────
 
@@ -760,12 +761,25 @@ class SwapVolume:
         buy_cancel, buy_replace, buy_place = self._diff_side(active_buys, target_buys, price_tol)
         sell_cancel, sell_replace, sell_place = self._diff_side(active_sells, target_sells, price_tol)
 
+        # pending 单排除在 diff 之外但要计入占位, 防止重复下单
+        pending_buys = sum(1 for ao in self.active_orders.values() if ao.side == "BUY" and ao.pending)
+        pending_sells = sum(1 for ao in self.active_orders.values() if ao.side == "SELL" and ao.pending)
+        buy_place = buy_place[pending_buys:]
+        sell_place = sell_place[pending_sells:]
+
         all_cancels = buy_cancel + sell_cancel
         all_replaces = buy_replace + sell_replace
         all_places = buy_place + sell_place
 
-        if all_cancels or all_replaces or all_places:
-            asyncio.ensure_future(self._execute_cycle(all_cancels, all_replaces, all_places))
+        if (all_cancels or all_replaces or all_places) and not self._cycle_running:
+            self._cycle_running = True
+            asyncio.ensure_future(self._run_cycle(all_cancels, all_replaces, all_places))
+
+    async def _run_cycle(self, cancels: list[int], replaces: list[ReplaceOp], places: list[TargetOrder]):
+        try:
+            await self._execute_cycle(cancels, replaces, places)
+        finally:
+            self._cycle_running = False
 
     async def _execute_cycle(self, cancels: list[int], replaces: list[ReplaceOp], places: list[TargetOrder]):
         await self._execute_batch_cancels(cancels)
