@@ -15,10 +15,10 @@
 strategy_id: "IV_001"
 
 # 现货交易对
-symbol: "XAUTUSDT"
+symbol: "SPKUSDT"
 
 # 每轮买入数量，单位为基础币数量
-quantity: "0.3"
+quantity: "3000"
 
 # 每轮完成后再次发起下一轮的等待时间，单位秒
 order_interval: 1
@@ -26,11 +26,11 @@ order_interval: 1
 # BBO 价差过滤（卖一价 - 买一价，单位 USDT 绝对值）
 # 当前价差 > max_spread 时跳过本轮，<= max_spread 时正常执行
 # 0 = 不限制
-max_spread: 0.01
+max_spread: 0.000001
 
 # 累计成交额上限，单位 USDT (买入额 + 卖出额双边总和)
 # 停止条件: (买入成交额 + 卖出成交额) >= max_volume
-max_volume: 200000
+max_volume: 25000
 
 # 买单或卖单单次等待成交的超时时间，单位秒
 order_timeout: 30
