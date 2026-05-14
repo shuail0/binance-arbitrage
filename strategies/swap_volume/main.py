@@ -137,7 +137,7 @@ class ActivityTracker:
 class Stats:
     def __init__(self, symbol: str):
         self.symbol = symbol
-        self.state_file = Path(__file__).parent / "volume_state.json"
+        self.state_file = Path(__file__).resolve().parents[2] / "volume_state.json"
         self.buy_volume = self.sell_volume = self.total_pnl = Decimal("0")
         self.order_count = 0
         self._load()

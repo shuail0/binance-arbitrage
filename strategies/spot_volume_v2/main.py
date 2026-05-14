@@ -108,7 +108,7 @@ class StrategyConfig:
 class Stats:
     def __init__(self, strategy_id: str, symbol: str):
         self.strategy_id, self.symbol = strategy_id, symbol
-        self.state_file = Path(__file__).parent / "volume_state.json"
+        self.state_file = Path(__file__).resolve().parents[2] / "volume_state.json"
         self.lock = asyncio.Lock()
         self.session_buy_volume = self.session_sell_volume = self.session_pnl = Decimal("0")
         self.session_fee = Decimal("0")

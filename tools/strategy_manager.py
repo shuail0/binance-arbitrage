@@ -67,9 +67,9 @@ CONFIG_FIELD_PATHS = {
         "strategy_id": ("strategy_id",),
         "symbol": ("symbol",),
         "quantity": ("quantity",),
-        "max_volume": ("maxVolume",),
-        "order_interval": ("orderInterval",),
-        "max_spread": ("maxSpread",),
+        "max_volume": ("max_volume",),
+        "order_interval": ("order_interval",),
+        "max_spread": ("max_spread",),
     },
     "spot_volume_v2": {
         "strategy_id": ("strategy_id",),

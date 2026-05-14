@@ -16,7 +16,9 @@ pip install -r requirements.txt
 ./run.sh mm2           # 做市
 ./run.sh swap          # 合约
 ./run.sh spot start    # 后台运行 (screen)
-./run.sh spot stop     # 停止
+./run.sh spot stop     # 优雅停止 (SIGINT → 撤单+清仓+保存状态，最长等 20s)
+./run.sh spot status   # 查看 screen 状态
+./run.sh spot logs     # attach screen，未运行则 tail 最近日志
 ```
 
 工具脚本：
@@ -92,6 +94,7 @@ Excel（`keys/币安API.xlsx`）驱动的多账号部署：
 - 日志: loguru（stdout + 按日轮转文件）
 - 数值: Decimal（价格/数量/统计），避免浮点
 - 价格/数量对齐: `_align_price()`(tickSize) / `_align_qty()`(stepSize)，下单前必须对齐
+- **SDK 下单 price/quantity 必须传 `str`**（Decimal/float 会被 SDK 校验拒绝）。所有策略已统一在调用 SDK 前 `str(decimal_value)`；改单/batch/单笔均同。`ModifyMultiple` 的 `order_id` 同样要字符串。
 - 统计持久化: volume_state.json (json, 按 symbol 分 key)
 - 中文注释、极简实现
 - SDK REST 方法均为同步，策略内用 `asyncio.to_thread()` 包装

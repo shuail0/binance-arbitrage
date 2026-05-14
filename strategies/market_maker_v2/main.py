@@ -54,7 +54,7 @@ class TargetOrder:
 class Stats:
     def __init__(self, instrument_id: str):
         self.instrument_id = instrument_id
-        self.state_file = Path(__file__).parent / "volume_state.json"
+        self.state_file = Path(__file__).resolve().parents[2] / "volume_state.json"
         self.session_buy_volume = self.session_sell_volume = self.session_pnl = Decimal("0")
         self.session_fee_base = self.session_fee_quote = Decimal("0")
         self.session_order_count = 0
