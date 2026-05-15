@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""策略管理工具 - 统一管理远程策略（启动、停止、查看、配置、同步、部署）"""
+# -*- coding: utf-8 -*-
+"""策略管理工具 - 多服务器策略部署/启停/监控/账户余额/市价买入"""
 
+import csv
+import hashlib
 import json
+import os
+import shlex
 import subprocess
 import sys
-import yaml
 import tempfile
-import os
 import time
-import random
-import shlex
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-from openpyxl import load_workbook
+from dataclasses import dataclass, field
+from datetime import datetime
 from getpass import getpass
+from pathlib import Path
+from threading import Lock
+
+import yaml
+from openpyxl import load_workbook
 
 try:
     from dotenv import load_dotenv
@@ -22,256 +27,317 @@ try:
 except ImportError:
     pass
 
+
+# ============================== 常量 ==============================
+
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+EXCEL_PATH = str(PROJECT_DIR / "keys" / "币安API.xlsx")
+REMOTE_DIR = "/home/ubuntu/binance-py"
+SSH_USER = "ubuntu"
+CONDA_ENV = "binance"
+DEPLOY_DEMO = os.getenv("BINANCE_DEMO", "0")
+DEFAULT_SSH_PASSWORD = os.getenv("SSH_PASSWORD") or "LIshuai110110"
+
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 print_lock = Lock()
 
-# ==================== 配置 ====================
-RANDOM_RANGE = {
-    "quantity": None,       # (min, max) 或 None 不随机
-    "max_volume": None,
+
+# ============================== 策略元数据 (单一数据源) ==============================
+
+@dataclass(frozen=True)
+class StrategySpec:
+    mode: str          # screen 名后缀 (bnc-<mode>)
+    name: str          # 目录名
+    desc: str          # 中文描述
+    config: str        # 相对项目根的配置文件路径
+    hot_reload: bool   # main.py 是否监控 mtime
+    # 通用字段名 → YAML 嵌套路径 (用于 view/edit/sync 通用化)
+    fields: dict = field(default_factory=dict)
+    # 快速编辑时展示的字段名
+    quick_edit: tuple = ()
+
+
+STRATEGIES = {
+    "1": StrategySpec(
+        mode="iv", name="instant_volume", desc="即时刷量",
+        config="strategies/instant_volume/config.yaml",
+        hot_reload=True,
+        fields={
+            "strategy_id": ("strategy_id",),
+            "symbol": ("symbol",),
+            "quantity": ("quantity",),
+            "max_volume": ("max_volume",),
+            "order_interval": ("order_interval",),
+            "order_timeout": ("order_timeout",),
+            "max_spread": ("max_spread",),
+        },
+        quick_edit=("quantity", "max_volume"),
+    ),
+    "2": StrategySpec(
+        mode="spot", name="spot_volume_v2", desc="现货刷量V2",
+        config="strategies/spot_volume_v2/config.yaml",
+        hot_reload=True,
+        fields={
+            "strategy_id": ("strategy_id",),
+            "symbol": ("symbol",),
+            "quantity": ("quantity",),
+            "max_volume": ("max_volume",),
+            "order_interval": ("order_interval",),
+            "step": ("step",),
+            "num_levels": ("num_levels",),
+            "max_net_buy": ("max_net_buy",),
+        },
+        quick_edit=("quantity", "max_volume"),
+    ),
+    "3": StrategySpec(
+        mode="mm2", name="market_maker_v2", desc="做市策略V2",
+        config="strategies/market_maker_v2/params.yaml",
+        hot_reload=True,
+        fields={
+            "symbol": ("instrument_id",),
+            "single_size": ("strategy", "single_size"),
+            "step": ("strategy", "step"),
+            "num_each_side": ("strategy", "num_of_order_each_side"),
+            "max_net_buy": ("strategy", "maximum_net_buy"),
+            "max_net_sell": ("strategy", "maximum_net_sell"),
+            "max_volume": ("strategy", "max_volume"),
+            "auto_close_on_exit": ("strategy", "auto_close_on_exit"),
+        },
+        quick_edit=("single_size", "max_volume"),
+    ),
+    "4": StrategySpec(
+        mode="swap", name="swap_volume", desc="合约刷量",
+        config="strategies/swap_volume/config.yaml",
+        hot_reload=True,
+        fields={
+            "strategy_id": ("strategyId",),
+            "symbol": ("symbol",),
+            "leverage": ("leverage",),
+            "margin_type": ("marginType",),
+            "quantity": ("strategy", "quantity"),
+            "max_volume": ("strategy", "maxVolume"),
+            "order_interval": ("strategy", "orderInterval"),
+            "step_size": ("strategy", "stepSize"),
+            "num_each_side": ("strategy", "numOrdersEachSide"),
+            "post_only": ("strategy", "postOnly"),
+        },
+        quick_edit=("quantity", "max_volume"),
+    ),
 }
-
-EXCEL_PATH = str(Path(__file__).resolve().parents[1] / "keys" / "币安API.xlsx")
-PROJECT_DIR = Path(__file__).resolve().parent.parent
-REMOTE_DIR = "/home/ubuntu/binance"
-SSH_USER = "ubuntu"
-# SSH 密码不硬编码。可通过环境变量 SSH_PASSWORD 注入 (如 export 或 .env), 否则交互式 getpass
-DEFAULT_SSH_PASSWORD = os.getenv("SSH_PASSWORD", "")
-CONDA_ENV = "binance"
-# 部署到远程时写入 .env 的 BINANCE_DEMO 值 (从本地 .env 继承; 默认 "0" 实盘)
-DEPLOY_DEMO = os.getenv("BINANCE_DEMO", "0")
-
-STRATEGY_MAP = {
-    "1": ("iv",   "instant_volume",   "即时刷量"),
-    "2": ("spot", "spot_volume_v2",   "现货刷量V2"),
-    "3": ("mm2",  "market_maker_v2",  "做市策略V2"),
-    "4": ("swap", "swap_volume",      "合约刷量"),
-}
-
-CONFIG_MAP = {
-    "instant_volume":   "strategies/instant_volume/config.yaml",
-    "spot_volume_v2":   "strategies/spot_volume_v2/config.yaml",
-    "market_maker_v2":  "strategies/market_maker_v2/params.yaml",
-    "swap_volume":      "strategies/swap_volume/config.yaml",
-}
-
-STRATEGY_CONFIGS = {k: (name, CONFIG_MAP[name], desc) for k, (_, name, desc) in STRATEGY_MAP.items()}
-
-# 支持热加载的策略 (main.py 里有 reload_hot_config_loop 或 _reload_config 监控 mtime)
-HOT_RELOAD_STRATEGIES = {"spot_volume_v2", "market_maker_v2", "swap_volume"}
-
-# 各策略字段到 YAML 路径的映射
-CONFIG_FIELD_PATHS = {
-    "instant_volume": {
-        "strategy_id": ("strategy_id",),
-        "symbol": ("symbol",),
-        "quantity": ("quantity",),
-        "max_volume": ("max_volume",),
-        "order_interval": ("order_interval",),
-        "max_spread": ("max_spread",),
-    },
-    "spot_volume_v2": {
-        "strategy_id": ("strategy_id",),
-        "symbol": ("symbol",),
-        "quantity": ("quantity",),
-        "max_volume": ("max_volume",),
-        "order_interval": ("order_interval",),
-        "step": ("step",),
-        "num_levels": ("num_levels",),
-        "max_net_buy": ("max_net_buy",),
-    },
-    "market_maker_v2": {
-        "symbol": ("instrument_id",),
-        "single_size": ("strategy", "single_size"),
-        "step": ("strategy", "step"),
-        "num_each_side": ("strategy", "num_of_order_each_side"),
-        "max_net_buy": ("strategy", "maximum_net_buy"),
-        "max_net_sell": ("strategy", "maximum_net_sell"),
-        "max_volume": ("strategy", "max_volume"),
-    },
-    "swap_volume": {
-        "strategy_id": ("strategyId",),
-        "symbol": ("symbol",),
-        "quantity": ("strategy", "quantity"),
-        "max_volume": ("strategy", "maxVolume"),
-        "order_interval": ("strategy", "orderInterval"),
-        "step_size": ("strategy", "stepSize"),
-        "num_each_side": ("strategy", "numOrdersEachSide"),
-        "leverage": ("leverage",),
-        "margin_type": ("marginType",),
-    },
-}
+BY_NAME = {s.name: s for s in STRATEGIES.values()}
 
 
-# ==================== 工具函数 ====================
+# ============================== 通用工具 ==============================
+
+def banner(title: str, ch: str = "=", width: int = 60):
+    print(f"\n{ch * width}\n{title}\n{ch * width}")
+
+
 def get_nested(data, path, default=None):
-    current = data
-    for key in path:
-        if not isinstance(current, dict) or key not in current:
+    if not path:
+        return default
+    cur = data
+    for k in path:
+        if not isinstance(cur, dict) or k not in cur:
             return default
-        current = current[key]
-    return current
+        cur = cur[k]
+    return cur
 
 
 def set_nested(data, path, value):
-    current = data
-    for key in path[:-1]:
-        current = current.setdefault(key, {})
-    current[path[-1]] = value
+    cur = data
+    for k in path[:-1]:
+        cur = cur.setdefault(k, {})
+    cur[path[-1]] = value
 
 
-def get_field_path(strategy_name, field_name):
-    return CONFIG_FIELD_PATHS.get(strategy_name, {}).get(field_name)
+def coerce(s: str):
+    """字符串 → 推断类型 (bool / int / float / str)"""
+    low = s.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    try:
+        return int(s) if "." not in s and "e" not in low else float(s)
+    except ValueError:
+        return s
 
 
-def get_config_value(config, strategy_name, field_name, default=None):
-    path = get_field_path(strategy_name, field_name)
-    return get_nested(config, path, default) if path else default
+def load_yaml(path) -> dict:
+    return yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
 
 
-def load_yaml_config(path):
-    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-    return data if isinstance(data, dict) else {}
+def _safe_float(v):
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return 0.0
 
 
-def normalize_server_id(value):
-    if value is None:
+def _server_sort_key(sid):
+    try:
+        return (0, int(sid))
+    except (ValueError, TypeError):
+        return (1, str(sid))
+
+
+# ============================== Excel 服务器列表 ==============================
+
+def _norm(s):
+    return str(s).strip().lower() if s is not None else ""
+
+
+def _pick_col(header_map, *candidates):
+    for c in candidates:
+        k = _norm(c)
+        if k in header_map:
+            return header_map[k]
+    for c in candidates:
+        k = _norm(c)
+        for hk, idx in header_map.items():
+            if k in hk:
+                return idx
+    return None
+
+
+def _norm_id(v):
+    if v is None:
         return ""
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
-    return str(value).strip()
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v).strip()
 
 
-# ==================== 服务器管理 ====================
-def read_servers(excel_path):
-    """读取服务器列表（自动匹配列名）"""
-    def normalize(text):
-        return str(text).strip().lower() if text is not None else ""
-
-    def pick_index(header_map, *candidates):
-        for c in candidates:
-            key = normalize(c)
-            if key in header_map:
-                return header_map[key]
-        for c in candidates:
-            key = normalize(c)
-            for hk, idx in header_map.items():
-                if key in hk:
-                    return idx
-        return None
-
+def read_servers(excel_path: str) -> list:
+    """从 Excel 读 (id, name, ip, api_key, key_path) 行, 过滤禁用"""
+    DISABLED = {"否", "不可用", "停用", "no", "n", "false", "0"}
     wb = load_workbook(excel_path, data_only=True)
     for ws in wb.worksheets:
         header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
         if not header_row:
             continue
-
-        header_map = {normalize(t): i for i, t in enumerate(header_row) if t}
-        ip_idx = pick_index(header_map, "IP", "服务器IP", "ip地址")
+        hm = {_norm(t): i for i, t in enumerate(header_row) if t}
+        ip_idx = _pick_col(hm, "IP", "服务器IP", "ip地址")
         if ip_idx is None:
             continue
+        id_idx = _pick_col(hm, "序号", "编号", "id")
+        name_idx = _pick_col(hm, "名称", "备注", "服务器名称")
+        api_idx = _pick_col(hm, "API key", "api key", "apikey")
+        key_idx = _pick_col(hm, "密钥路径", "密钥", "key path", "private key")
+        enabled_idx = _pick_col(hm, "是否可用", "可用", "启用")
 
-        id_idx = pick_index(header_map, "序号", "编号", "id")
-        name_idx = pick_index(header_map, "名称", "备注", "服务器名称")
-        api_idx = pick_index(header_map, "API key", "api key", "apikey")
-        key_path_idx = pick_index(header_map, "密钥路径", "密钥", "key path", "private key")
-        enabled_idx = pick_index(header_map, "是否可用", "可用", "启用", "是否启用")
+        def cell(row, idx):
+            return str(row[idx] or "").strip() if idx is not None and idx < len(row) else ""
 
         servers = []
         for row in ws.iter_rows(min_row=2, values_only=True):
-            ip = str(row[ip_idx] or "").strip() if ip_idx is not None and ip_idx < len(row) else ""
+            ip = cell(row, ip_idx)
             if not ip:
                 continue
-
-            if enabled_idx is not None and enabled_idx < len(row):
-                val = normalize(row[enabled_idx])
-                if val in ("否", "不可用", "停用", "no", "n", "false", "0"):
-                    continue
-
-            def cell(idx):
-                return str(row[idx] or "").strip() if idx is not None and idx < len(row) else ""
-
-            servers.append({
-                "id": normalize_server_id(row[id_idx] if id_idx is not None and id_idx < len(row) else len(servers) + 1),
-                "name": cell(name_idx),
-                "api_key": cell(api_idx),
-                "key_path": cell(key_path_idx),
-                "ip": ip,
-            })
-
+            if enabled_idx is not None and enabled_idx < len(row) and _norm(row[enabled_idx]) in DISABLED:
+                continue
+            sid = _norm_id(row[id_idx] if id_idx is not None and id_idx < len(row) else len(servers) + 1)
+            servers.append({"id": sid, "name": cell(row, name_idx),
+                            "api_key": cell(row, api_idx), "key_path": cell(row, key_idx), "ip": ip})
         if servers:
             return servers
-
     return []
 
 
+# ============================== SSH ==============================
+
 def run_ssh(ip, password, command, timeout=30, retry=False):
-    """执行 SSH 命令"""
-    max_attempts = MAX_RETRIES if retry else 1
-    for attempt in range(1, max_attempts + 1):
+    """通过 sshpass+bash 远程执行. retry: 仅传输错误重试, 应用层错误立即返回."""
+    attempts = MAX_RETRIES if retry else 1
+    for i in range(1, attempts + 1):
+        cmd = [
+            "sshpass", "-p", password, "ssh",
+            "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=5", f"{SSH_USER}@{ip}", "bash", "-s",
+        ]
         try:
-            cmd = [
-                "sshpass", "-p", password, "ssh",
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "ConnectTimeout=10",
-                "-o", "ServerAliveInterval=5",
-                f"{SSH_USER}@{ip}", "bash", "-s",
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=command)
-            if result.returncode == 0 or attempt == max_attempts:
-                return result.returncode == 0, result.stdout, result.stderr
-            with print_lock:
-                print(f"   ⚠️  第 {attempt} 次尝试失败，{RETRY_DELAY}秒后重试...")
-            time.sleep(RETRY_DELAY)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=command)
+            if r.returncode == 0 or i == attempts:
+                return r.returncode == 0, r.stdout, r.stderr
         except subprocess.TimeoutExpired:
-            if attempt == max_attempts:
-                return False, "", f"SSH命令执行超时（>{timeout}秒）"
-            with print_lock:
-                print(f"   ⚠️  第 {attempt} 次超时，{RETRY_DELAY}秒后重试...")
-            time.sleep(RETRY_DELAY)
+            if i == attempts:
+                return False, "", f"SSH 超时 (>{timeout}s)"
+        with print_lock:
+            print(f"   ⚠️  第 {i} 次尝试失败, {RETRY_DELAY}s 后重试...")
+        time.sleep(RETRY_DELAY)
     return False, "", "重试耗尽"
 
 
-def upload_files(ip, password, local_path, remote_path, retry=True):
-    """上传文件"""
-    max_attempts = MAX_RETRIES if retry else 1
-    for attempt in range(1, max_attempts + 1):
+def upload_files(ip, password, local, remote, retry=True):
+    """scp 上传 (本地→远端). 列表参数 + shell=False 防注入."""
+    attempts = MAX_RETRIES if retry else 1
+    last_err = ""
+    for i in range(1, attempts + 1):
         cmd = [
             "sshpass", "-p", password, "scp",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "ConnectTimeout=10",
-            "-r", str(local_path),
-            f"{SSH_USER}@{ip}:{remote_path}",
+            "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+            "-r", str(local), f"{SSH_USER}@{ip}:{remote}",
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode == 0:
-            return True, result.stderr
-        if attempt < max_attempts:
-            with print_lock:
-                print(f"   ⚠️  第 {attempt} 次尝试失败，{RETRY_DELAY}秒后重试...")
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if r.returncode == 0:
+            return True, r.stderr
+        last_err = r.stderr
+        if i < attempts:
             time.sleep(RETRY_DELAY)
-    return False, result.stderr
+    return False, last_err
 
+
+def upload_text(ip, password, content: str, remote_path: str, mode: int = 0o600) -> bool:
+    """字符串写临时文件 → scp → chmod"""
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+        f.write(content)
+        tmp = Path(f.name)
+    try:
+        ok, _ = upload_files(ip, password, tmp, remote_path, retry=True)
+        if ok and mode:
+            run_ssh(ip, password, f"chmod {mode:o} {shlex.quote(remote_path)}", timeout=5)
+        return ok
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def make_env_content(api_key: str, key_path: str) -> str:
+    key_basename = os.path.basename(key_path) if key_path else ""
+    remote_key = f"{REMOTE_DIR}/{key_basename}" if key_basename else ""
+    return (f"BINANCE_API_KEY={api_key}\n"
+            f"BINANCE_PRIVATE_KEY_PATH={remote_key}\n"
+            f"BINANCE_DEMO={DEPLOY_DEMO}\n")
+
+
+def remote_python_cmd(script_path: str, args: list) -> str:
+    """构造远程激活 conda 环境后执行 python 脚本的 bash 命令"""
+    quoted = " ".join(shlex.quote(a) for a in args)
+    return (f"cd {REMOTE_DIR} && "
+            f". $HOME/miniconda3/etc/profile.d/conda.sh 2>/dev/null && "
+            f"conda activate {CONDA_ENV} 2>/dev/null && "
+            f"python3 {script_path} {quoted}")
+
+
+# ============================== 交互 prompts ==============================
 
 def select_servers(servers):
-    print("\n可用服务器列表：")
+    print("\n可用服务器:")
     for s in servers:
         print(f"  {s['id']}. {s['ip']} ({s['name']})")
-
-    server_input = input("\n请输入服务器编号（多个用逗号分隔，或 'all' 选择所有）: ").strip()
-    if server_input.lower() == 'all':
+    inp = input("\n服务器编号 (逗号分隔 / 'all'): ").strip()
+    if inp.lower() == "all":
         return servers
-    selected_ids = {x.strip() for x in server_input.split(",") if x.strip()}
-    return [s for s in servers if s["id"] in selected_ids]
+    ids = {x.strip() for x in inp.split(",") if x.strip()}
+    return [s for s in servers if s["id"] in ids]
 
 
 def select_strategy():
-    print("\n可用策略：")
-    for k, (_, name, desc) in sorted(STRATEGY_MAP.items()):
-        print(f"  {k}. {desc} ({name})")
-    choice = input(f"请选择策略 ({'/'.join(sorted(STRATEGY_MAP.keys()))}): ").strip()
-    return STRATEGY_MAP.get(choice)
+    print("\n可用策略:")
+    for k, s in STRATEGIES.items():
+        print(f"  {k}. {s.desc} ({s.name})")
+    return STRATEGIES.get(input(f"选择策略 ({'/'.join(STRATEGIES)}): ").strip())
 
 
 def get_password():
@@ -281,763 +347,832 @@ def get_password():
     return getpass("\n请输入 SSH 密码: ")
 
 
-def randomize_value(key, fallback):
-    r = RANDOM_RANGE.get(key)
-    return random.randint(r[0], r[1]) if r else fallback
+# ============================== Remote Helper ==============================
 
-
-# ==================== 同步 & 部署 ====================
-def sync_server(server, password, strategies_to_sync, rand_qty=False, rand_vol=False):
-    """同步单台服务器的配置（.env + 策略配置）"""
-    ip, server_id, server_name = server["ip"], server["id"], server["name"]
-    api_key = server.get("api_key", "")
-    key_path = server.get("key_path", "")
-
-    print(f"\n{'='*60}")
-    print(f"同步服务器 {server_id}: {ip} ({server_name})")
-    print(f"{'='*60}")
-
-    total_steps = 1 + len(strategies_to_sync)
-
-    # 1. 同步 .env
-    print(f"[1/{total_steps}] 同步 .env（API 密钥）...")
-    key_filename = os.path.basename(key_path) if key_path else ""
-    remote_key_path = f"{REMOTE_DIR}/{key_filename}" if key_filename else ""
-
-    env_content = (
-        f"BINANCE_API_KEY={api_key}\n"
-        f"BINANCE_PRIVATE_KEY_PATH={remote_key_path}\n"
-        f"BINANCE_DEMO={DEPLOY_DEMO}\n"
-    )
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
-        f.write(env_content)
-        tmp_env = Path(f.name)
-    success, error = upload_files(ip, password, tmp_env, f"{REMOTE_DIR}/.env", retry=True)
-    tmp_env.unlink(missing_ok=True)
-    if not success:
-        print(f"❌ 同步 .env 失败: {error}")
+def ensure_remote_helper(ip, password) -> bool:
+    """本地 tools/remote_helper.py md5 与远端不一致则上传"""
+    local = PROJECT_DIR / "tools" / "remote_helper.py"
+    if not local.exists():
         return False
-    # 远程 .env 含凭证, 收紧权限
-    run_ssh(ip, password, f"chmod 600 {REMOTE_DIR}/.env", timeout=10)
+    remote = f"{REMOTE_DIR}/tools/remote_helper.py"
+    local_md5 = hashlib.md5(local.read_bytes()).hexdigest()
+    ok, out, _ = run_ssh(
+        ip, password, f"md5sum {shlex.quote(remote)} 2>/dev/null | awk '{{print $1}}'",
+        timeout=5, retry=False,
+    )
+    if ok and out.strip() == local_md5:
+        return True
+    run_ssh(ip, password, f"mkdir -p {REMOTE_DIR}/tools", timeout=5)
+    ok, _ = upload_files(ip, password, local, remote, retry=True)
+    return ok
+
+
+def exec_remote_helper(ip, password, args: list, timeout=30) -> dict:
+    """SSH 调用 remote_helper.py, 解析最后一行 JSON"""
+    _, stdout, stderr = run_ssh(
+        ip, password, remote_python_cmd("tools/remote_helper.py", args),
+        timeout=timeout, retry=False,
+    )
+    lines = (stdout or "").strip().splitlines()
+    for line in reversed(lines):
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return {"_transport_err": (stderr or stdout or "无输出")[:300]}
+
+
+# ============================== Sync (.env + 策略配置) ==============================
+
+def sync_server(server, password, specs_to_sync) -> bool:
+    ip, sid, name = server["ip"], server["id"], server["name"]
+    banner(f"同步服务器 {sid}: {ip} ({name})")
+
+    # 1. .env
+    print(f"[1] 同步 .env (API 密钥)...")
+    if not upload_text(ip, password, make_env_content(server.get("api_key", ""), server.get("key_path", "")),
+                       f"{REMOTE_DIR}/.env"):
+        print(f"❌ .env 同步失败")
+        return False
     print(f"✅ .env 已同步")
 
-    # 上传密钥文件 + 收紧权限
+    # 上传密钥
+    key_path = server.get("key_path", "")
     if key_path and os.path.exists(key_path):
-        success, error = upload_files(ip, password, key_path, f"{REMOTE_DIR}/")
-        if not success:
-            print(f"⚠️  上传密钥文件失败: {error}")
-        elif remote_key_path:
-            run_ssh(ip, password, f"chmod 600 {shlex.quote(remote_key_path)}", timeout=10)
+        if upload_files(ip, password, key_path, f"{REMOTE_DIR}/")[0]:
+            run_ssh(ip, password,
+                    f"chmod 600 {REMOTE_DIR}/{shlex.quote(os.path.basename(key_path))}",
+                    timeout=5)
 
-    # 2. 同步策略配置 (先过滤掉本地缺失的, 再连续编号)
-    valid_strategies = [(n, p, d) for n, p, d in strategies_to_sync
-                        if (PROJECT_DIR / p).exists()]
-    missing = [d for n, p, d in strategies_to_sync if not (PROJECT_DIR / p).exists()]
-    for desc in missing:
-        print(f"⚠️  跳过 {desc}: 本地配置文件不存在")
-    total_steps = 1 + len(valid_strategies)
+    # 2. 策略配置
+    valid = [s for s in specs_to_sync if (PROJECT_DIR / s.config).exists()]
+    for missing in [s for s in specs_to_sync if not (PROJECT_DIR / s.config).exists()]:
+        print(f"⚠️  跳过 {missing.desc}: 本地缺失")
 
-    for step, (strategy_name, config_path, desc) in enumerate(valid_strategies, 2):
-        print(f"[{step}/{total_steps}] 同步 {desc} 配置...")
-        local_path = PROJECT_DIR / config_path
-
-        # 确保远程目录存在
-        remote_dir = f"{REMOTE_DIR}/{os.path.dirname(config_path)}"
-        run_ssh(ip, password, f"mkdir -p {shlex.quote(remote_dir)}", retry=False)
-
-        if rand_qty or rand_vol:
-            config = load_yaml_config(local_path)
-
-            if strategy_name == "market_maker_v2":
-                s = config.get("strategy", {})
-                if rand_qty and "single_size" in s:
-                    orig = s["single_size"]
-                    s["single_size"] = randomize_value("quantity", orig)
-                    print(f"   📊 随机 single_size: {orig} → {s['single_size']}")
-                if rand_vol and s.get("max_volume"):
-                    orig = s["max_volume"]
-                    s["max_volume"] = randomize_value("max_volume", orig)
-                    print(f"   📈 随机 max_volume: {orig} → {s['max_volume']}")
-            elif strategy_name == "swap_volume":
-                s = config.get("strategy", {})
-                if rand_qty and "quantity" in s:
-                    orig = s["quantity"]
-                    s["quantity"] = str(randomize_value("quantity", orig))
-                    print(f"   📊 随机 quantity: {orig} → {s['quantity']}")
-                if rand_vol and s.get("maxVolume"):
-                    orig = s["maxVolume"]
-                    s["maxVolume"] = randomize_value("max_volume", orig)
-                    print(f"   📈 随机 maxVolume: {orig} → {s['maxVolume']}")
-            else:
-                if rand_qty and "quantity" in config:
-                    orig = config["quantity"]
-                    config["quantity"] = randomize_value("quantity", orig)
-                    print(f"   📊 随机 quantity: {orig} → {config['quantity']}")
-                if rand_vol and config.get("max_volume", config.get("maxVolume")):
-                    vol_key = "maxVolume" if "maxVolume" in config else "max_volume"
-                    orig = config[vol_key]
-                    config[vol_key] = randomize_value("max_volume", orig)
-                    print(f"   📈 随机 {vol_key}: {orig} → {config[vol_key]}")
-
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
-                yaml.dump(config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
-                tmp_config = Path(f.name)
-            success, error = upload_files(ip, password, tmp_config, f"{REMOTE_DIR}/{config_path}", retry=True)
-            tmp_config.unlink(missing_ok=True)
-        else:
-            success, error = upload_files(ip, password, local_path, f"{REMOTE_DIR}/{config_path}", retry=True)
-
-        if not success:
-            print(f"❌ 同步 {desc} 失败: {error}")
+    for i, spec in enumerate(valid, 2):
+        print(f"[{i}] 同步 {spec.desc} 配置...")
+        run_ssh(ip, password, f"mkdir -p {shlex.quote(REMOTE_DIR + '/' + os.path.dirname(spec.config))}",
+                timeout=5)
+        if not upload_files(ip, password, PROJECT_DIR / spec.config,
+                            f"{REMOTE_DIR}/{spec.config}", retry=True)[0]:
+            print(f"❌ 同步 {spec.desc} 失败")
             return False
-        print(f"✅ {desc} 配置已同步")
+        print(f"✅ {spec.desc} 已同步")
 
-    print(f"✅ 服务器 {server_id} 配置同步完成")
+    print(f"✅ 服务器 {sid} 同步完成")
     return True
 
 
-def deploy_server(server, password, full_setup=False):
-    """部署单台服务器"""
-    ip, server_id, server_name = server["ip"], server["id"], server["name"]
-    total_steps = 5 if full_setup else 4
+# ============================== Deploy ==============================
 
+def deploy_server(server, password, full_setup=False, code_only=False):
+    """部署单台服务器
+    - code_only=True : 仅上传 .py/.sh, 不覆盖配置和 .env (excludes yaml/json/.env)
+    - 默认           : 代码 + 配置 + .env + 密钥
+    - full_setup=True: 默认基础上额外安装 miniconda + 创建 conda env + pip install
+    """
+    ip, sid, name = server["ip"], server["id"], server["name"]
+    total = 5 if full_setup else (2 if code_only else 4)
+    tag = " [仅代码]" if code_only else ""
     with print_lock:
-        print(f"\n{'='*60}")
-        print(f"[{server_id}] 开始部署: {ip} ({server_name})")
-        print(f"{'='*60}")
+        banner(f"[{sid}] 部署 {ip} ({name}){tag}")
 
-    # 1. 创建远程目录
-    with print_lock:
-        print(f"[{server_id}] [1/{total_steps}] 创建远程目录...")
-    success, _, error = run_ssh(ip, password, f"mkdir -p {REMOTE_DIR}/logs {REMOTE_DIR}/strategies {REMOTE_DIR}/tools", retry=True)
-    if not success:
+    def step(i, msg):
         with print_lock:
-            print(f"[{server_id}] ❌ 创建目录失败: {error}")
-        return False, server, f"创建目录失败: {error}"
+            print(f"[{sid}] [{i}/{total}] {msg}")
 
-    # 2. 上传代码 (rsync 排除配置和日志)
-    with print_lock:
-        print(f"[{server_id}] [2/{total_steps}] 上传代码...")
-    exclude_args = [
-        "--exclude=.env", "--exclude=__pycache__", "--exclude=logs/",
-        "--exclude=.git", "--exclude=keys/",
-    ]
-    for name in ("strategies", "tools"):
-        local = PROJECT_DIR / name
+    # 1. 远程目录
+    step(1, "创建远程目录...")
+    ok, _, err = run_ssh(ip, password,
+                         f"mkdir -p {REMOTE_DIR}/logs {REMOTE_DIR}/strategies {REMOTE_DIR}/tools",
+                         retry=True)
+    if not ok:
+        return False, server, f"mkdir 失败: {err}"
+
+    # 2. rsync 代码
+    step(2, "上传代码 (rsync)...")
+    excl = ["--exclude=.env", "--exclude=__pycache__", "--exclude=logs/",
+            "--exclude=.git", "--exclude=keys/"]
+    if code_only:
+        excl += ["--exclude=*.yaml", "--exclude=*.yml", "--exclude=*.json"]
+    for sub in ("strategies", "tools"):
+        local = PROJECT_DIR / sub
         if not local.exists():
             continue
-        # 列表参数 + shell=False, 避免密码/IP 中特殊字符被 shell 注入
-        cmd = [
-            "sshpass", "-p", password,
-            "rsync", "-az", *exclude_args,
-            "-e", "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10",
-            f"{local}/", f"{SSH_USER}@{ip}:{REMOTE_DIR}/{name}/",
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode != 0:
-            with print_lock:
-                print(f"[{server_id}] ❌ 上传 {name} 失败: {result.stderr}")
-            return False, server, f"上传 {name} 失败"
+        r = subprocess.run(
+            ["sshpass", "-p", password, "rsync", "-az", *excl,
+             "-e", "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10",
+             f"{local}/", f"{SSH_USER}@{ip}:{REMOTE_DIR}/{sub}/"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode != 0:
+            return False, server, f"rsync {sub} 失败: {r.stderr[:200]}"
         with print_lock:
-            print(f"[{server_id}]    ✅ {name} 已更新")
+            print(f"[{sid}]    ✅ {sub} 已同步")
 
-    # 上传 run.sh + requirements.txt
     for fname in ("run.sh", "requirements.txt"):
         local = PROJECT_DIR / fname
         if local.exists():
             upload_files(ip, password, local, f"{REMOTE_DIR}/{fname}")
+    run_ssh(ip, password, f"chmod +x {REMOTE_DIR}/run.sh")
 
-    # 3. 生成并上传 .env
-    with print_lock:
-        print(f"[{server_id}] [3/{total_steps}] 生成并上传 .env...")
-    api_key = server.get("api_key", "")
-    key_path = server.get("key_path", "")
-    key_filename = os.path.basename(key_path) if key_path else ""
-    remote_key_path = f"{REMOTE_DIR}/{key_filename}" if key_filename else ""
-
-    env_content = (
-        f"BINANCE_API_KEY={api_key}\n"
-        f"BINANCE_PRIVATE_KEY_PATH={remote_key_path}\n"
-        f"BINANCE_DEMO={DEPLOY_DEMO}\n"
-    )
-    # tempfile 默认创建 0600 权限, 避免同机其他用户读取凭证
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
-        f.write(env_content)
-        tmp_env = Path(f.name)
-    success, error = upload_files(ip, password, tmp_env, f"{REMOTE_DIR}/.env", retry=True)
-    tmp_env.unlink(missing_ok=True)
-    if not success:
+    if code_only:
         with print_lock:
-            print(f"[{server_id}] ❌ 上传 .env 失败: {error}")
-        return False, server, f"上传 .env 失败: {error}"
-    # 远程 .env 含凭证, 收紧权限
-    run_ssh(ip, password, f"chmod 600 {REMOTE_DIR}/.env", timeout=10)
+            print(f"[{sid}] ✅ 部署成功（仅代码，配置未变）")
+        return True, server, None
 
-    # 上传密钥 + 收紧权限
+    # 3. .env + 密钥
+    step(3, "上传 .env + 密钥...")
+    if not upload_text(ip, password, make_env_content(server.get("api_key", ""), server.get("key_path", "")),
+                       f"{REMOTE_DIR}/.env"):
+        return False, server, "上传 .env 失败"
+    key_path = server.get("key_path", "")
     if key_path and os.path.exists(key_path):
         upload_files(ip, password, key_path, f"{REMOTE_DIR}/")
-        if remote_key_path:
-            run_ssh(ip, password, f"chmod 600 {shlex.quote(remote_key_path)}", timeout=10)
+        run_ssh(ip, password,
+                f"chmod 600 {REMOTE_DIR}/{shlex.quote(os.path.basename(key_path))}", timeout=5)
 
-    # 4. 设置执行权限 + 确保 screen 已安装
-    with print_lock:
-        print(f"[{server_id}] [4/{total_steps}] 设置执行权限...")
-    run_ssh(ip, password, f"chmod +x {REMOTE_DIR}/run.sh")
-    # 非交互式尝试装 screen, 失败不阻断 (Ubuntu 预装; 其他发行版或密码 sudo 会跳过)
+    # 4. screen
+    step(4, "安装 screen (若缺)...")
     run_ssh(ip, password,
             "command -v screen >/dev/null || sudo -n apt-get install -y screen 2>/dev/null || true",
             timeout=30)
 
-    # 5. 可选：安装 conda 环境
+    # 5. conda (可选)
     if full_setup:
-        with print_lock:
-            print(f"[{server_id}] [5/{total_steps}] 安装 conda 环境...")
+        step(5, "安装 conda 环境...")
         run_ssh(ip, password, (
-            'test -d $HOME/miniconda3 || '
-            '(curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/mc.sh '
-            '&& bash /tmp/mc.sh -b -p $HOME/miniconda3 && rm /tmp/mc.sh '
-            '&& $HOME/miniconda3/bin/conda init bash)'
+            "test -d $HOME/miniconda3 || ("
+            "curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/mc.sh && "
+            "bash /tmp/mc.sh -b -p $HOME/miniconda3 && rm /tmp/mc.sh && "
+            "$HOME/miniconda3/bin/conda init bash)"
         ), timeout=300, retry=True)
         run_ssh(ip, password, (
-            f'source $HOME/miniconda3/etc/profile.d/conda.sh && '
-            f'(conda env list | grep -q "^{CONDA_ENV} " || conda create -n {CONDA_ENV} python=3.12 -y) && '
-            f'conda activate {CONDA_ENV} && '
-            f'pip install -r {REMOTE_DIR}/requirements.txt'
+            f". $HOME/miniconda3/etc/profile.d/conda.sh && "
+            f"(conda env list | grep -q '^{CONDA_ENV} ' || conda create -n {CONDA_ENV} python=3.12 -y) && "
+            f"conda activate {CONDA_ENV} && pip install -r {REMOTE_DIR}/requirements.txt"
         ), timeout=300, retry=True)
 
     with print_lock:
-        print(f"[{server_id}] ✅ 部署成功")
+        print(f"[{sid}] ✅ 部署成功")
     return True, server, None
 
 
-# ==================== 功能模块 ====================
-def start_strategy(server, mode, name, desc, password):
-    """启动策略"""
-    ip, server_id = server['ip'], server['id']
+# ============================== 单策略 action ==============================
 
-    print(f"\n{'='*60}")
-    print(f"在服务器 {server_id} ({ip}) 启动 {desc}")
-    print(f"{'='*60}")
+def _action_banner(server, spec, verb: str):
+    banner(f"服务器 {server['id']} ({server['ip']}) - {verb} {spec.desc}")
 
-    # 检查是否已运行
-    check_cmd = f'screen -list 2>/dev/null | grep "bnc-{mode}" || true'
-    _, stdout, _ = run_ssh(ip, password, check_cmd)
-    if f"bnc-{mode}" in stdout:
-        pid_cmd = f'pgrep -f "python.*strategies/{name}/main.py" || true'
-        _, pid_out, _ = run_ssh(ip, password, pid_cmd, timeout=5)
-        if pid_out.strip():
-            print(f"⚠️  策略已在运行中（screen: bnc-{mode}）")
-            return True
+
+def start_strategy(server, spec, password):
+    _action_banner(server, spec, "启动")
+    ip, mode, name = server["ip"], spec.mode, spec.name
+
+    # 检测已运行
+    _, out, _ = run_ssh(ip, password, f'screen -list 2>/dev/null | grep "bnc-{mode}" || true')
+    if f"bnc-{mode}" in out:
+        _, pid, _ = run_ssh(ip, password, f'pgrep -f "python.*strategies/{name}/main.py" || true', timeout=5)
+        if pid.strip():
+            print(f"⚠️  策略已在运行 (screen: bnc-{mode})")
+            return
         run_ssh(ip, password, f'screen -S "bnc-{mode}" -X quit 2>/dev/null', timeout=5)
 
-    # 启动 (screen 应在部署阶段已安装; 若未装则报错提示而非阻塞等 sudo 密码)
-    launch_cmd = f"""
+    launch = f"""
 if ! command -v screen >/dev/null; then
-    echo "ERROR: screen 未安装, 请在本机运行部署流程或手动 'sudo apt-get install -y screen'"
+    echo "ERROR: screen 未安装, 先运行部署 (action 8) 或手动 'sudo apt-get install -y screen'"
     exit 1
 fi
 screen -dmS "bnc-{mode}" bash -c '
-    source $HOME/miniconda3/etc/profile.d/conda.sh 2>/dev/null
+    . $HOME/miniconda3/etc/profile.d/conda.sh 2>/dev/null
     conda activate {CONDA_ENV} 2>/dev/null
     cd {REMOTE_DIR}
     python strategies/{name}/main.py
-'
-"""
-    run_ssh(ip, password, launch_cmd, timeout=10)
-
+'"""
+    run_ssh(ip, password, launch, timeout=10)
     time.sleep(2)
-    verify_cmd = f'screen -list 2>/dev/null | grep "bnc-{mode}" && echo "OK" || echo "FAILED"'
-    _, stdout, _ = run_ssh(ip, password, verify_cmd, timeout=5)
-
-    if "OK" in stdout:
-        print(f"✅ 策略已启动（screen: bnc-{mode}）")
-    else:
-        print(f"❌ 启动失败")
-    return "OK" in stdout
+    _, out, _ = run_ssh(ip, password, f'screen -list 2>/dev/null | grep "bnc-{mode}" && echo OK', timeout=5)
+    print(f"✅ 已启动 (screen: bnc-{mode})" if "OK" in out else "❌ 启动失败")
 
 
-def stop_strategy(server, mode, name, desc, password):
-    """停止策略（SIGINT 优雅退出 → 超时强制 kill）"""
-    ip, server_id = server['ip'], server['id']
-
-    print(f"\n{'='*60}")
-    print(f"在服务器 {server_id} ({ip}) 停止 {desc}")
-    print(f"{'='*60}")
-
+def stop_strategy(server, spec, password):
+    _action_banner(server, spec, "停止")
     stop_cmd = f"""
 PID=""
-for p in $(pgrep -f "strategies/{name}/main.py" 2>/dev/null); do
-    case "$(cat /proc/$p/comm 2>/dev/null)" in
-        python*) PID=$p; break;;
-    esac
+for p in $(pgrep -f "strategies/{spec.name}/main.py" 2>/dev/null); do
+    case "$(cat /proc/$p/comm 2>/dev/null)" in python*) PID=$p; break;; esac
 done
 if [ -n "$PID" ]; then
-    echo "发送 SIGINT 到进程 $PID..."
+    echo "发送 SIGINT 到 $PID..."
     kill -INT $PID
-    for i in $(seq 1 30); do
-        kill -0 $PID 2>/dev/null || break
-        sleep 1
-    done
-    if kill -0 $PID 2>/dev/null; then
-        echo "优雅退出超时，强制终止..."
-        kill -9 $PID 2>/dev/null
-    fi
+    for i in $(seq 1 30); do kill -0 $PID 2>/dev/null || break; sleep 1; done
+    kill -0 $PID 2>/dev/null && {{ echo "强制 kill"; kill -9 $PID 2>/dev/null; }}
     echo "STOPPED"
 else
     echo "NOT_RUNNING"
 fi
-screen -S "bnc-{mode}" -X quit 2>/dev/null
+screen -S "bnc-{spec.mode}" -X quit 2>/dev/null
 """
-    _, stdout, stderr = run_ssh(ip, password, stop_cmd, timeout=60)
-
-    if "NOT_RUNNING" in stdout:
-        print(f"⚠️  策略未运行")
-    elif "STOPPED" in stdout:
-        print(f"✅ 策略已停止")
+    _, out, err = run_ssh(server["ip"], password, stop_cmd, timeout=60)
+    if "NOT_RUNNING" in out:
+        print("⚠️  策略未运行")
+    elif "STOPPED" in out:
+        print("✅ 策略已停止")
     else:
-        print(f"❌ 停止失败: {stderr.strip()}")
+        print(f"❌ 停止失败: {err.strip()}")
 
 
-def view_status(server, mode, name, desc, password):
-    """查看运行状态"""
-    ip, server_id = server['ip'], server['id']
+def _render_progress(volume: float, max_volume: float):
+    if not max_volume or max_volume <= 0:
+        return
+    pct = min(volume / max_volume * 100, 100.0)
+    bar_w = 40
+    filled = int(bar_w * pct / 100)
+    print(f"\n📍 进度: {volume:,.2f} / {max_volume:,.2f} USDT ({pct:.1f}%)")
+    print(f"[{'█' * filled}{'░' * (bar_w - filled)}] {pct:.1f}%")
 
-    print(f"\n{'='*60}")
-    print(f"服务器 {server_id} ({ip}) - {desc}")
-    print(f"{'='*60}")
 
-    # 1. 检查进程
-    cmd = f'ps aux | grep "python.*strategies/{name}/main.py" | grep -v grep'
-    _, stdout, _ = run_ssh(ip, password, cmd)
-    if stdout.strip():
-        print("✅ 策略正在运行：")
-        print(stdout.rstrip())
-    else:
-        print("❌ 策略未运行")
+def _print_symbol_stats(stats: dict, symbol: str, max_volume: float):
+    buy = _safe_float(stats.get("global_buy_volume"))
+    sell = _safe_float(stats.get("global_sell_volume"))
+    pnl = _safe_float(stats.get("global_pnl"))
+    volume = buy + sell
+    banner(f"📊 全局统计数据" + (f"（{symbol}）" if symbol else ""))
+    print(f"💰 累计总成交额: {volume:,.2f} USDT")
+    print(f"📈 买入成交额:   {buy:,.2f} USDT")
+    print(f"📉 卖出成交额:   {sell:,.2f} USDT")
+    tag = "盈利" if pnl > 0 else ("亏损" if pnl < 0 else "持平")
+    print(f"💎 累计盈亏:     {pnl:+,.6f} USDT ({tag})")
+    print(f"🕐 最后更新:     {stats.get('updated_at', 'N/A')}")
+    _render_progress(volume, max_volume)
 
-    # 2. screen 会话
-    cmd = f'screen -list 2>/dev/null | grep "bnc-{mode}" || echo "无 screen 会话"'
-    _, stdout, _ = run_ssh(ip, password, cmd)
-    print(f"\nScreen: {stdout.strip()}")
 
-    # 3. 读取策略配置
-    config_path = f"{REMOTE_DIR}/{CONFIG_MAP[name]}"
-    _, config_stdout, _ = run_ssh(ip, password, f"cat {shlex.quote(config_path)} 2>/dev/null")
+def view_status(server, spec, password):
+    _action_banner(server, spec, "状态")
+    ip = server["ip"]
 
+    _, out, _ = run_ssh(ip, password, f'ps aux | grep "python.*strategies/{spec.name}/main.py" | grep -v grep')
+    print("✅ 策略正在运行：" if out.strip() else "❌ 策略未运行")
+    if out.strip():
+        print(out.rstrip())
+
+    _, out, _ = run_ssh(ip, password, f'screen -list 2>/dev/null | grep "bnc-{spec.mode}" || echo "无 screen 会话"')
+    print(f"\nScreen: {out.strip()}")
+
+    # config + state
+    _, cfg_out, _ = run_ssh(ip, password, f"cat {shlex.quote(REMOTE_DIR + '/' + spec.config)} 2>/dev/null")
     config = {}
-    max_volume = 0
-    if config_stdout.strip():
+    max_volume = 0.0
+    if cfg_out.strip():
         try:
-            config = yaml.safe_load(config_stdout) or {}
-            max_volume = get_config_value(config, name, "max_volume", 0) or 0
+            config = yaml.safe_load(cfg_out) or {}
+            max_volume = _safe_float(get_nested(config, spec.fields.get("max_volume"), 0))
         except Exception:
             pass
 
-    # 4. 读取 volume_state.json
-    state_cmd = f"cat {REMOTE_DIR}/volume_state.json 2>/dev/null"
-    success, state_stdout, _ = run_ssh(ip, password, state_cmd)
-
-    if success and state_stdout.strip():
-        try:
-            all_state = json.loads(state_stdout)
-            symbol = get_config_value(config, name, "symbol", "")
-            # 精确匹配 symbol; 如果查不到不退回首个 (可能是历史遗留数据, 会误导用户)
-            data = all_state.get(symbol, {}) if symbol else {}
-
-            if data:
-                buy = float(data.get('global_buy_volume', 0))
-                sell = float(data.get('global_sell_volume', 0))
-                volume = buy + sell
-                pnl = float(data.get('global_pnl', 0))
-                updated_at = data.get('updated_at', 'N/A')
-
-                print(f"\n{'='*60}")
-                print(f"📊 全局统计数据" + (f"（{symbol}）" if symbol else ""))
-                print(f"{'='*60}")
-                print(f"💰 累计总成交额: {volume:,.2f} USDT")
-                print(f"📈 买入成交额:   {buy:,.2f} USDT")
-                print(f"📉 卖出成交额:   {sell:,.2f} USDT")
-
-                if pnl > 0:
-                    print(f"💎 累计盈亏:     +{pnl:,.6f} USDT (盈利)")
-                elif pnl < 0:
-                    print(f"📊 累计盈亏:     {pnl:,.6f} USDT (亏损)")
-                else:
-                    print(f"⚖️  累计盈亏:     0 USDT")
-
-                print(f"🕐 最后更新:     {updated_at}")
-
-                if max_volume and max_volume > 0:
-                    progress = (volume / float(max_volume)) * 100
-                    print(f"\n📍 进度: {volume:,.2f} / {float(max_volume):,.2f} USDT ({progress:.1f}%)")
-                    bar_length = 40
-                    filled = int(bar_length * min(progress, 100) / 100)
-                    print(f"[{'█' * filled}{'░' * (bar_length - filled)}] {progress:.1f}%")
-            else:
-                print(f"\n📊 未找到 {symbol or '该策略'} 的统计数据")
-
-        except Exception as e:
-            print(f"\n⚠️  解析统计数据失败: {e}")
-    else:
+    _, state_out, _ = run_ssh(ip, password, f"cat {REMOTE_DIR}/volume_state.json 2>/dev/null")
+    if not state_out.strip():
         print(f"\n📊 volume_state.json 不存在（首次运行或未产生交易）")
+        return
+    try:
+        all_state = json.loads(state_out)
+    except json.JSONDecodeError as e:
+        print(f"\n⚠️  解析 volume_state.json 失败: {e}")
+        return
+
+    symbol = get_nested(config, spec.fields.get("symbol"), "")
+    stats = all_state.get(symbol, {}) if symbol else {}
+    if stats:
+        _print_symbol_stats(stats, symbol, max_volume)
+    else:
+        print(f"\n📊 未找到 {symbol or '该策略'} 的统计数据")
 
 
-def view_logs(server, mode, name, desc, password):
-    """查看日志（最后50行）"""
-    ip, server_id = server['ip'], server['id']
-
-    print(f"\n{'='*60}")
-    print(f"服务器 {server_id} ({ip}) - {desc} 日志（最后50行）")
-    print(f"{'='*60}")
-
-    cmd = f'ls -t {REMOTE_DIR}/logs/*{mode}*.log 2>/dev/null | head -1'
-    _, log_file, _ = run_ssh(ip, password, cmd)
-    log_file = log_file.strip()
-
-    if not log_file:
-        cmd = f'ls -t {REMOTE_DIR}/logs/*.log 2>/dev/null | head -1'
-        _, log_file, _ = run_ssh(ip, password, cmd)
+def view_logs(server, spec, password):
+    _action_banner(server, spec, "日志 (最后 50 行)")
+    ip = server["ip"]
+    for pattern in (f"*{spec.mode}*.log", "*.log"):
+        _, log_file, _ = run_ssh(ip, password, f'ls -t {REMOTE_DIR}/logs/{pattern} 2>/dev/null | head -1')
         log_file = log_file.strip()
-
+        if log_file:
+            break
     if not log_file:
         print("⚠️  日志文件不存在")
         return
-
-    _, stdout, _ = run_ssh(ip, password, f"tail -50 {shlex.quote(log_file)}")
-    if stdout.strip():
-        print(f"📄 日志文件: {log_file}")
-        print(stdout)
+    _, out, _ = run_ssh(ip, password, f"tail -50 {shlex.quote(log_file)}")
+    if out.strip():
+        print(f"📄 {log_file}")
+        print(out)
     else:
         print("⚠️  日志为空")
 
 
-def view_config(server, mode, name, desc, password, display_mode='formatted'):
-    """查看配置"""
-    ip, server_id = server['ip'], server['id']
-
-    print(f"\n{'='*60}")
-    print(f"服务器 {server_id} ({ip}) - {desc} 配置")
-    print(f"{'='*60}")
-
-    config_path = f"{REMOTE_DIR}/{CONFIG_MAP[name]}"
-    _, stdout, _ = run_ssh(ip, password, f"cat {shlex.quote(config_path)} 2>/dev/null || echo 'FILE_NOT_FOUND'")
-
-    if "FILE_NOT_FOUND" in stdout:
+def view_config(server, spec, password, display_mode="formatted"):
+    _action_banner(server, spec, "配置")
+    ip = server["ip"]
+    config_path = f"{REMOTE_DIR}/{spec.config}"
+    _, out, _ = run_ssh(ip, password, f"cat {shlex.quote(config_path)} 2>/dev/null || echo FILE_NOT_FOUND")
+    if "FILE_NOT_FOUND" in out:
         print(f"❌ 配置文件不存在: {config_path}")
         return
 
-    if display_mode == 'raw':
-        print(f"\n原始 YAML：")
-        print(stdout)
+    if display_mode == "raw":
+        print("\n原始 YAML:")
+        print(out)
     else:
         try:
-            config = yaml.safe_load(stdout) or {}
-            print(f"\n当前配置：")
-            print(f"{'='*60}")
-
-            if name == "market_maker_v2":
-                print(f"\n📋 基本信息：")
-                print(f"  instrument_id: {config.get('instrument_id', 'N/A')}")
-                s = config.get('strategy', {})
-                print(f"\n💰 交易参数：")
-                print(f"  single_size:           {s.get('single_size', 'N/A')}")
-                print(f"  step:                  {s.get('step', 'N/A')}")
-                print(f"  num_of_order_each_side:{s.get('num_of_order_each_side', 'N/A')}")
-                print(f"  maximum_net_buy:       {s.get('maximum_net_buy', 'N/A')}")
-                print(f"  maximum_net_sell:      {s.get('maximum_net_sell', 'N/A')}")
-                print(f"  max_volume:            {s.get('max_volume', 'N/A')}")
-                print(f"  auto_close_on_exit:    {s.get('auto_close_on_exit', 'N/A')}")
-            elif name == "swap_volume":
-                print(f"\n📋 基本信息：")
-                print(f"  strategyId:  {config.get('strategyId', 'N/A')}")
-                print(f"  symbol:      {config.get('symbol', 'N/A')}")
-                print(f"  leverage:    {config.get('leverage', 'N/A')}x")
-                print(f"  marginType:  {config.get('marginType', 'N/A')}")
-                s = config.get('strategy', {})
-                print(f"\n💰 交易参数：")
-                print(f"  quantity:       {s.get('quantity', 'N/A')}")
-                print(f"  stepSize:       {s.get('stepSize', 'N/A')}")
-                print(f"  numEachSide:    {s.get('numOrdersEachSide', 'N/A')}")
-                print(f"  maxVolume:      {s.get('maxVolume', 'N/A')}")
-                print(f"  orderInterval:  {s.get('orderInterval', 'N/A')}s")
-                print(f"  postOnly:       {s.get('postOnly', False)}")
-            else:
-                print(f"\n📋 基本信息：")
-                print(f"  strategy_id: {config.get('strategy_id', 'N/A')}")
-                print(f"  symbol:      {config.get('symbol', 'N/A')}")
-                print(f"\n💰 交易参数：")
-                print(f"  quantity:       {config.get('quantity', 'N/A')}")
-                print(f"  orderInterval:  {config.get('orderInterval', config.get('order_interval', 'N/A'))}s")
-                vol = config.get('maxVolume', config.get('max_volume', 'N/A'))
-                print(f"  maxVolume:      {vol}")
-
-            print(f"\n{'='*60}")
+            config = yaml.safe_load(out) or {}
+            print(f"\n📋 {spec.desc} ({spec.name})  热加载: {'✅' if spec.hot_reload else '❌'}")
+            print("─" * 60)
+            for fname, path in spec.fields.items():
+                val = get_nested(config, path, "N/A")
+                print(f"  {fname:<20} = {val}")
         except Exception as e:
             print(f"❌ YAML 解析失败: {e}")
-            print(stdout)
+            print(out)
 
-    # .env（脱敏显示）
-    print(f"\n📋 .env 配置：")
-    _, env_stdout, _ = run_ssh(ip, password, f"cat {REMOTE_DIR}/.env 2>/dev/null || echo 'FILE_NOT_FOUND'")
-    if "FILE_NOT_FOUND" in env_stdout:
-        print("  .env 文件不存在")
-    else:
-        for line in env_stdout.splitlines():
-            if "=" in line and not line.startswith("#"):
-                key, val = line.split("=", 1)
-                key = key.strip()
-                if key == "BINANCE_API_KEY" and len(val) > 10:
-                    print(f"  {key}={val[:6]}...{val[-4:]}")
-                elif key == "BINANCE_PRIVATE_KEY_PATH":
-                    print(f"  {key}={os.path.basename(val)}")
-                else:
-                    print(f"  {line}")
-
-
-def update_config(server, mode, name, desc, password):
-    """修改配置"""
-    ip, server_id = server['ip'], server['id']
-
-    print(f"\n{'='*60}")
-    print(f"修改服务器 {server_id} ({ip}) - {desc} 配置")
-    print(f"{'='*60}")
-
-    config_path = f"{REMOTE_DIR}/{CONFIG_MAP[name]}"
-    success, stdout, stderr = run_ssh(ip, password, f"cat {shlex.quote(config_path)}")
-    if not success:
-        print(f"❌ 读取配置失败: {stderr}")
+    # .env 脱敏
+    print("\n📋 .env:")
+    _, env_out, _ = run_ssh(ip, password, f"cat {REMOTE_DIR}/.env 2>/dev/null || echo FILE_NOT_FOUND")
+    if "FILE_NOT_FOUND" in env_out:
+        print("  .env 不存在")
         return
+    for line in env_out.splitlines():
+        if "=" not in line or line.startswith("#"):
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        if key == "BINANCE_API_KEY" and len(val) > 10:
+            print(f"  {key}={val[:6]}...{val[-4:]}")
+        elif key == "BINANCE_PRIVATE_KEY_PATH":
+            print(f"  {key}={os.path.basename(val)}")
+        else:
+            print(f"  {line}")
 
+
+def update_config(server, spec, password):
+    _action_banner(server, spec, "修改配置")
+    ip = server["ip"]
+    config_path = f"{REMOTE_DIR}/{spec.config}"
+    ok, out, err = run_ssh(ip, password, f"cat {shlex.quote(config_path)}")
+    if not ok:
+        print(f"❌ 读取配置失败: {err}")
+        return
     try:
-        config = yaml.safe_load(stdout) or {}
+        config = yaml.safe_load(out) or {}
     except Exception as e:
         print(f"❌ YAML 解析失败: {e}")
         return
 
-    print("\n当前配置：")
+    print("\n当前配置:")
     print(yaml.dump(config, allow_unicode=True, default_flow_style=False))
 
-    print("修改模式：")
-    print("  1. 快速修改（quantity / maxVolume）")
-    print("  2. 高级修改（任意参数）")
-    mode_choice = input("请选择模式 (1/2): ").strip()
+    print(f"修改模式:\n  1. 快速修改 ({', '.join(spec.quick_edit)})\n  2. 高级修改 (任意字段)")
+    choice = input("(1/2): ").strip()
     updates = {}
 
-    if mode_choice == "1":
-        print("\n请输入要修改的配置（留空跳过）：")
-        if name == "market_maker_v2":
-            s = config.get("strategy", {})
-            v = input(f"  single_size [当前: {s.get('single_size')}]: ").strip()
-            if v: updates["strategy.single_size"] = v
-            v = input(f"  max_volume [当前: {s.get('max_volume')}]: ").strip()
-            if v: updates["strategy.max_volume"] = v
-        elif name == "swap_volume":
-            s = config.get("strategy", {})
-            v = input(f"  quantity [当前: {s.get('quantity')}]: ").strip()
-            if v: updates["strategy.quantity"] = v
-            v = input(f"  maxVolume [当前: {s.get('maxVolume')}]: ").strip()
-            if v: updates["strategy.maxVolume"] = v
-        else:
-            v = input(f"  quantity [当前: {config.get('quantity')}]: ").strip()
-            if v: updates["quantity"] = v
-            v = input(f"  maxVolume [当前: {config.get('maxVolume', config.get('max_volume'))}]: ").strip()
-            if v: updates["maxVolume" if "maxVolume" in config else "max_volume"] = v
-
-    elif mode_choice == "2":
-        print("\n请输入要修改的参数（格式: key=value，每行一个，空行结束）：")
-        print("嵌套参数用点号：strategy.quantity=500")
+    if choice == "1":
+        for fname in spec.quick_edit:
+            path = spec.fields[fname]
+            cur = get_nested(config, path)
+            v = input(f"  {fname} [当前: {cur}]: ").strip()
+            if v:
+                set_nested(config, path, coerce(v))
+                updates[fname] = v
+    elif choice == "2":
+        print("\nkey=value 每行一个, 空行结束. 嵌套用点: strategy.quantity=500")
         while True:
             line = input("> ").strip()
             if not line:
                 break
-            if '=' not in line:
-                print("  ⚠️  格式错误，请使用 key=value 格式")
+            if "=" not in line:
+                print("  ⚠️  格式: key=value")
                 continue
-            key, value = line.split('=', 1)
-            updates[key.strip()] = value.strip()
+            key, val = line.split("=", 1)
+            set_nested(config, key.strip().split("."), coerce(val.strip()))
+            updates[key.strip()] = val.strip()
 
     if not updates:
         print("\n⚠️  未修改任何参数")
         return
 
-    # 应用修改
-    for key, value in updates.items():
-        if isinstance(value, str):
-            if value.lower() == 'true': value = True
-            elif value.lower() == 'false': value = False
-            else:
-                try:
-                    value = int(value) if '.' not in str(value) else float(value)
-                except ValueError:
-                    pass
-        set_nested(config, key.split('.'), value)
+    yaml_str = yaml.dump(config, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    print("\n上传新配置...")
+    if upload_text(ip, password, yaml_str, config_path, mode=0):
+        print("✅ 配置已更新")
+        for k, v in updates.items():
+            print(f"  {k}: {v}")
+        print("\n💡 " + ("策略支持热加载, 无需重启" if spec.hot_reload else "需重启才生效"))
+    else:
+        print(f"❌ 上传失败")
 
-    # 上传
-    print("\n正在上传新配置...")
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False, encoding='utf-8') as f:
-        yaml.dump(config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
-        tmp_path = Path(f.name)
+
+# ============================== 账户余额 ==============================
+
+ACCOUNT_LABELS = {"funding": "资金账户", "spot": "现货账户", "futures": "合约账户"}
+
+
+def query_single_balance(server, password, accounts, assets):
+    if not ensure_remote_helper(server["ip"], password):
+        return None
+    args = ["balance", "--accounts", accounts]
+    if assets:
+        args += ["--assets", assets]
+    return exec_remote_helper(server["ip"], password, args, timeout=30)
+
+
+
+def parallel_query_balance(servers, password, accounts, assets):
+    print(f"\n🔍 并行查询 {len(servers)} 服务器...")
+    results = []
+    with ThreadPoolExecutor(max_workers=min(10, len(servers))) as ex:
+        futures = {ex.submit(query_single_balance, s, password, accounts, assets): s for s in servers}
+        for fut in as_completed(futures):
+            srv = futures[fut]
+            try:
+                data = fut.result()
+            except Exception as e:
+                with print_lock:
+                    print(f"[{srv['id']}] ❌ 异常: {e}")
+                continue
+            if data and not data.get("_transport_err"):
+                results.append({"server": srv, "data": data})
+                with print_lock:
+                    print(f"[{srv['id']}] ✅ 完成")
+            else:
+                err = (data or {}).get("_transport_err", "未知错误")
+                with print_lock:
+                    print(f"[{srv['id']}] ❌ {err[:120]}")
+    return results
+
+
+def _collect_account_assets(results, acct):
+    """聚合账户内所有非零资产 + 每服务器映射. USDT 优先, 其余字母序"""
+    asset_set = set()
+    per_server = {}
+    for item in results:
+        sid = item["server"]["id"]
+        section = (item["data"] or {}).get(acct) or {}
+        if section.get("err"):
+            per_server[sid] = {"_err": section["err"]}
+            continue
+        m = {}
+        for it in (section.get("items") or []):
+            a = it.get("asset", "")
+            if a:
+                m[a] = (_safe_float(it.get("free")), _safe_float(it.get("locked")))
+                asset_set.add(a)
+        per_server[sid] = m
+    return sorted(asset_set, key=lambda a: (0, a) if a == "USDT" else (1, a)), per_server
+
+
+def _balance_blocks(results, accounts):
+    """yields (title, assets, per_server_rows, totals)"""
+    for acct in accounts:
+        assets, per_server = _collect_account_assets(results, acct)
+        rows = []
+        totals = {a: [0.0, 0.0] for a in assets}
+        for item in results:
+            sid, name = item["server"]["id"], item["server"]["name"]
+            m = per_server.get(sid, {})
+            if "_err" in m:
+                rows.append({"sid": sid, "name": name, "err": m["_err"]})
+                continue
+            row = {"sid": sid, "name": name, "cells": []}
+            for a in assets:
+                free, locked = m.get(a, (0.0, 0.0))
+                row["cells"].append((free, locked))
+                totals[a][0] += free
+                totals[a][1] += locked
+            rows.append(row)
+        yield ACCOUNT_LABELS.get(acct, acct), assets, rows, totals
+
+
+def print_balance_table(results, accounts):
+    if not results:
+        print("\n⚠️  无数据")
+        return
+    results.sort(key=lambda r: _server_sort_key(r["server"]["id"]))
+    account_list = [a.strip() for a in accounts.split(",") if a.strip()]
+    W_ID, W_NAME, W_NUM = 6, 14, 16
+    fmt = lambda v: f"{v:>{W_NUM},.4f}"
+
+    print(f"\n查询时间: {datetime.now():%Y-%m-%d %H:%M:%S} | 服务器数: {len(results)}")
+    for title, assets, rows, totals in _balance_blocks(results, account_list):
+        width = max(50, W_ID + 1 + W_NAME + len(assets) * 2 * (1 + W_NUM))
+        print("\n" + "=" * width)
+        print(title)
+        print("=" * width)
+        if not assets:
+            errs = [r for r in rows if "err" in r]
+            if errs:
+                for r in errs:
+                    print(f"  ❌ 服务器 {r['sid']}: {r['err'][:120]}")
+            else:
+                print("  (无非零余额)")
+            continue
+        header = f"{'服务器':<{W_ID}} {'名称':<{W_NAME}}"
+        for a in assets:
+            header += f" {a + '(可用)':>{W_NUM}} {a + '(冻结)':>{W_NUM}}"
+        print(header)
+        print("-" * width)
+        for r in rows:
+            if "err" in r:
+                print(f"{r['sid']:<{W_ID}} {r['name']:<{W_NAME}}   ❌ {r['err'][:80]}")
+                continue
+            line = f"{r['sid']:<{W_ID}} {r['name']:<{W_NAME}}"
+            for free, locked in r["cells"]:
+                line += f" {fmt(free)} {fmt(locked)}"
+            print(line)
+        print("-" * width)
+        total_row = f"{'合计':<{W_ID}} {'':<{W_NAME}}"
+        for a in assets:
+            tf, tl = totals[a]
+            total_row += f" {fmt(tf)} {fmt(tl)}"
+        print(total_row)
+    print()
+
+
+def export_balance_csv(results, accounts):
+    if not results:
+        print("⚠️  无数据可导出")
+        return
+    results.sort(key=lambda r: _server_sort_key(r["server"]["id"]))
+    account_list = [a.strip() for a in accounts.split(",") if a.strip()]
+    logs = PROJECT_DIR / "logs"
+    logs.mkdir(exist_ok=True)
+    filepath = logs / f"balance_{datetime.now():%Y%m%d_%H%M%S}.csv"
+
+    with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["查询时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "服务器数", len(results)])
+        w.writerow([])
+        for title, assets, rows, totals in _balance_blocks(results, account_list):
+            w.writerow([title])
+            header = ["服务器", "名称"]
+            for a in assets:
+                header += [f"{a}(可用)", f"{a}(冻结)"]
+            w.writerow(header)
+            for r in rows:
+                if "err" in r:
+                    w.writerow([r["sid"], r["name"], f"错误: {r['err']}"])
+                    continue
+                row = [r["sid"], r["name"]]
+                for free, locked in r["cells"]:
+                    row += [f"{free:.4f}", f"{locked:.4f}"]
+                w.writerow(row)
+            total_row = ["合计", ""]
+            for a in assets:
+                tf, tl = totals[a]
+                total_row += [f"{tf:.4f}", f"{tl:.4f}"]
+            w.writerow(total_row)
+            w.writerow([])
+    print(f"\n✅ CSV 已导出: {filepath}")
+
+
+def select_accounts():
+    print("\n查询账户:")
+    print("  1. 全部 (资金+现货+合约) [默认]")
+    print("  2. 仅资金账户")
+    print("  3. 仅现货账户")
+    print("  4. 仅合约账户")
+    print("  5. 自定义 (逗号分隔: funding,spot,futures)")
+    choice = input("(1-5, 默认 1): ").strip() or "1"
+    m = {"1": "funding,spot,futures", "2": "funding", "3": "spot", "4": "futures"}
+    if choice in m:
+        return m[choice]
+    if choice == "5":
+        custom = input("账户: ").strip().lower()
+        valid = [a.strip() for a in custom.split(",")
+                 if a.strip() in ACCOUNT_LABELS]
+        return ",".join(valid) if valid else "funding,spot,futures"
+    return "funding,spot,futures"
+
+
+def query_balance_main(selected_servers):
+    accounts = select_accounts()
+    assets_input = input("\n资产筛选 (逗号分隔, 留空=所有非零, 例: USDT,BNB,BTC): ").strip()
+    assets = ",".join(a.strip().upper() for a in assets_input.split(",") if a.strip())
+    password = get_password()
+
+    results = parallel_query_balance(selected_servers, password, accounts, assets)
+    if not results:
+        print("\n❌ 无结果")
+        return
+    print_balance_table(results, accounts)
+    if input("\n导出 CSV? (y/N): ").strip().lower() == "y":
+        export_balance_csv(results, accounts)
+
+
+# ============================== 市价买入 ==============================
+
+def buy_single_server(server, password, symbol, mode, amount):
+    if not ensure_remote_helper(server["ip"], password):
+        return None
+    args = ["buy", "--symbol", symbol]
+    args += ["--quote", amount] if mode == "usdt" else ["--quantity", amount]
+    return exec_remote_helper(server["ip"], password, args, timeout=30)
+
+
+def buybnb_main(selected_servers):
+    symbol = (input("\n交易对 (默认 BNBUSDT): ").strip() or "BNBUSDT").upper()
+    print("\n买入模式:\n  1. 按基础币数量 (quantity)\n  2. 按 USDT 金额 (quoteOrderQty)")
+    mode = "usdt" if input("(1/2, 默认 1): ").strip() == "2" else "quantity"
+    base = symbol[:3] or "BASE"
+    prompt = "USDT 金额 (如 100)" if mode == "usdt" else f"{base} 数量 (如 0.5)"
+    amount = input(f"\n每服务器 {prompt}: ").strip()
     try:
-        success, error = upload_files(ip, password, tmp_path, config_path)
-        if success:
-            print("✅ 配置已更新")
-            for key, value in updates.items():
-                print(f"  {key}: {value}")
-            if name in HOT_RELOAD_STRATEGIES:
-                print("\n💡 提示：策略支持热加载，无需重启即可生效")
-            else:
-                print("\n💡 提示：配置已更新，需要重启才能生效")
+        if float(amount) <= 0:
+            raise ValueError
+    except ValueError:
+        print(f"❌ 无效数字: {amount}")
+        return
+
+    label = f"{amount} USDT 等值 {base}" if mode == "usdt" else f"{amount} {base}"
+    print(f"\n⚠️  即将在 {len(selected_servers)} 服务器市价买入 {label}")
+    if input("确认 (yes/N): ").strip().lower() not in ("y", "yes"):
+        print("已取消")
+        return
+    password = get_password()
+
+    print("\n🚀 并行执行...")
+    results = []
+    with ThreadPoolExecutor(max_workers=min(10, len(selected_servers))) as ex:
+        futures = {ex.submit(buy_single_server, s, password, symbol, mode, amount): s for s in selected_servers}
+        for fut in as_completed(futures):
+            srv = futures[fut]
+            try:
+                data = fut.result()
+                if data:
+                    results.append({"server": srv, "data": data})
+            except Exception as e:
+                with print_lock:
+                    print(f"[{srv['id']}] ❌ 异常: {e}")
+
+    results.sort(key=lambda r: _server_sort_key(r["server"]["id"]))
+    sep = "=" * 100
+    print(f"\n{sep}")
+    print(f"{'服务器':<18}{'状态':<8}{'OrderID':>14}{'成交量':>14}{'成交额':>18}{'均价':>14}{'手续费':>22}")
+    print("-" * 100)
+    total_qty = total_quote = total_fee = 0.0
+    ok = 0
+    for r in results:
+        srv, d = r["server"], r["data"]
+        tag = f"{srv['id']}/{(srv['name'] or '')[:8]}"
+        if d.get("_transport_err") or not d.get("ok"):
+            err = (d.get("err") or d.get("_transport_err") or "失败")[:20]
+            print(f"{tag:<18}{'失败':<8}{'-':>14}{'-':>14}{'-':>18}{'-':>14}{err:>22}")
+            continue
+        ok += 1
+        qty = _safe_float(d.get("executedQty"))
+        quote = _safe_float(d.get("cumQuoteQty"))
+        fee_bnb = d.get("feeBNB") or "0"
+        fee_other = d.get("feeOther") or ""
+        total_qty += qty
+        total_quote += quote
+        total_fee += _safe_float(fee_bnb)
+        fee_str = f"{fee_bnb} BNB" + (f"+{fee_other}" if fee_other else "")
+        print(f"{tag:<18}{'✅ ' + (d.get('status') or ''):<8}"
+              f"{str(d.get('orderId', '-')):>14}{qty:>14.6f}{quote:>18.4f}"
+              f"{(d.get('avgPrice') or '-'):>14}{fee_str:>22}")
+    print("-" * 100)
+    print(f"{'合计':<18}{ok}/{len(selected_servers)}{'':<2}{'':>14}"
+          f"{total_qty:>14.6f}{total_quote:>18.4f}{'':>14}{total_fee:>20.6f} BNB")
+    print(sep)
+
+
+# ============================== 流程编排 ==============================
+
+PER_STRATEGY_ACTIONS = {
+    "1": ("启动策略", start_strategy),
+    "2": ("停止策略", stop_strategy),
+    "3": ("查看运行状态", view_status),
+    "4": ("查看日志（最后50行）", view_logs),
+    "5": ("查看配置", view_config),
+    "6": ("修改配置", update_config),
+}
+
+
+def sync_main(selected_servers):
+    print("\n当前本地配置:")
+    for k, spec in STRATEGIES.items():
+        lp = PROJECT_DIR / spec.config
+        if not lp.exists():
+            continue
+        cfg = load_yaml(lp)
+        sym = get_nested(cfg, spec.fields.get("symbol"))
+        vol = get_nested(cfg, spec.fields.get("max_volume"))
+        print(f"  {spec.desc}: symbol={sym} max_volume={vol}")
+
+    print("\n选择同步策略:")
+    for k, spec in STRATEGIES.items():
+        print(f"  {k}. {spec.desc} ({spec.name})")
+    print("  all. 全部")
+    inp = input("选择 (逗号分隔 / all): ").strip()
+    if inp == "all":
+        specs = list(STRATEGIES.values())
+    else:
+        specs = [STRATEGIES[k.strip()] for k in inp.split(",") if k.strip() in STRATEGIES]
+    if not specs:
+        print("❌ 无效选择")
+        return
+
+    password = get_password()
+    ok = sum(1 for srv in selected_servers if sync_server(srv, password, specs))
+    banner(f"同步完成: 成功 {ok}, 失败 {len(selected_servers) - ok}")
+
+
+def deploy_main(selected_servers):
+    print("\n部署模式:")
+    print("  1. 仅代码 (不覆盖配置和 .env)")
+    print("  2. 全量部署 (代码 + 配置 + .env) [默认]")
+    print("  3. 完整安装 (代码 + 配置 + .env + conda + pip)")
+    choice = input("请选择 (1/2/3, 默认 2): ").strip() or "2"
+    code_only = choice == "1"
+    full = choice == "3"
+    mode_desc = "仅代码" if code_only else ("完整安装" if full else "全量部署")
+    password = get_password()
+    banner(f"🚀 并行部署 {len(selected_servers)} 台服务器 [{mode_desc}]")
+    t0 = time.time()
+    success_list, failed_list = [], []
+    with ThreadPoolExecutor(max_workers=min(10, len(selected_servers))) as ex:
+        futures = {ex.submit(deploy_server, s, password, full, code_only): s for s in selected_servers}
+        for fut in as_completed(futures):
+            try:
+                ok, srv, err = fut.result()
+                (success_list if ok else failed_list).append(srv if ok else (srv, err))
+            except Exception as e:
+                failed_list.append((futures[fut], str(e)))
+                with print_lock:
+                    print(f"[{futures[fut]['id']}] ❌ 异常: {e}")
+    banner(f"部署完成: 成功 {len(success_list)}, 失败 {len(failed_list)} (耗时 {time.time()-t0:.1f}s)")
+    if failed_list:
+        print("\n❌ 失败服务器:")
+        for s, err in failed_list:
+            print(f"  {s['id']}. {s['ip']} - {err}")
+
+
+def per_strategy_main(action_key, selected_servers):
+    _, handler = PER_STRATEGY_ACTIONS[action_key]
+    spec = select_strategy()
+    if not spec:
+        print("❌ 无效策略")
+        return
+    password = get_password()
+    display_mode = None
+    if action_key == "5":
+        display_mode = "raw" if input("\n显示模式 (1.美观 / 2.原始 YAML, 默认 1): ").strip() == "2" else "formatted"
+    for srv in selected_servers:
+        if action_key == "5":
+            handler(srv, spec, password, display_mode)
         else:
-            print(f"❌ 上传配置失败: {error}")
-    finally:
-        tmp_path.unlink(missing_ok=True)
+            handler(srv, spec, password)
+    banner("操作完成")
 
 
-# ==================== 主菜单 ====================
 def main():
-    result = subprocess.run("which sshpass", shell=True, capture_output=True)
-    if result.returncode != 0:
-        print("❌ 未安装 sshpass，请先安装：brew install hudochenkov/sshpass/sshpass")
+    if subprocess.run("which sshpass", shell=True, capture_output=True).returncode != 0:
+        print("❌ 未安装 sshpass: brew install hudochenkov/sshpass/sshpass")
         sys.exit(1)
 
-    print("=" * 60)
-    print("         Binance Python 策略管理工具 v1.0")
-    print("=" * 60)
-    print("\n可用操作：")
-    print("  1. 启动策略")
-    print("  2. 停止策略")
-    print("  3. 查看运行状态")
-    print("  4. 查看日志（最后50行）")
-    print("  5. 查看配置")
-    print("  6. 修改配置")
-    print("  7. 同步配置（.env + 策略配置）")
-    print("  8. 部署代码")
+    banner("Binance Python 策略管理工具 v2.0")
+    actions = [
+        *[(k, v[0]) for k, v in PER_STRATEGY_ACTIONS.items()],
+        ("7", "同步配置 (.env + 策略配置)"),
+        ("8", "部署代码"),
+        ("9", "查询账户余额 (资金/现货/合约)"),
+        ("10", "市价买入 token"),
+    ]
+    print("\n可用操作:")
+    for k, label in actions:
+        print(f"  {k:>2}. {label}")
 
-    action = input("\n请选择操作 (1-8): ").strip()
-    if action not in [str(i) for i in range(1, 9)]:
-        print("❌ 无效的操作选择")
+    valid_keys = {k for k, _ in actions}
+    choice = input(f"\n选择 (1-{len(actions)}): ").strip()
+    if choice not in valid_keys:
+        print("❌ 无效")
         sys.exit(1)
 
     servers = read_servers(EXCEL_PATH)
     if not servers:
-        print("❌ 未找到任何可用服务器")
+        print("❌ 未找到可用服务器")
+        sys.exit(1)
+    selected = select_servers(servers)
+    if not selected:
+        print("❌ 未选择服务器")
         sys.exit(1)
 
-    selected_servers = select_servers(servers)
-    if not selected_servers:
-        print("❌ 未选择任何服务器")
-        sys.exit(1)
-
-    # 同步配置
-    if action == "7":
-        print("\n当前本地配置：")
-        for _, (sname, spath, sdesc) in STRATEGY_CONFIGS.items():
-            lp = PROJECT_DIR / spath
-            if lp.exists():
-                cfg = load_yaml_config(lp)
-                symbol = get_config_value(cfg, sname, "symbol")
-                vol = get_config_value(cfg, sname, "max_volume")
-                print(f"  {sdesc}: symbol={symbol} max_volume={vol}")
-
-        print("\n选择同步的策略：")
-        for k, (sname, _, sdesc) in STRATEGY_CONFIGS.items():
-            print(f"  {k}. {sdesc} ({sname})")
-        print("  all. 全部策略")
-        sc = input("请选择（多个用逗号分隔，或 all）: ").strip()
-
-        if sc == "all":
-            strategies_to_sync = list(STRATEGY_CONFIGS.values())
-        else:
-            strategies_to_sync = [STRATEGY_CONFIGS[x.strip()] for x in sc.split(",") if x.strip() in STRATEGY_CONFIGS]
-        if not strategies_to_sync:
-            print("❌ 无效选择")
-            sys.exit(1)
-
-        rand_qty = input("\n随机化 quantity? (y/N): ").strip().lower() == "y"
-        rand_vol = input("随机化 max_volume? (y/N): ").strip().lower() == "y"
-        password = get_password()
-
-        success_count, failed_count = 0, 0
-        for server in selected_servers:
-            if sync_server(server, password, strategies_to_sync, rand_qty=rand_qty, rand_vol=rand_vol):
-                success_count += 1
-            else:
-                failed_count += 1
-
-        print(f"\n{'='*60}")
-        print(f"同步完成！成功: {success_count}，失败: {failed_count}")
-        print(f"{'='*60}")
-        return
-
-    # 部署代码
-    if action == "8":
-        full_setup = input("\n是否完整安装（含 conda 环境）？(y/N): ").strip().lower() == "y"
-        password = get_password()
-
-        print(f"\n{'='*60}")
-        print(f"🚀 开始并行部署 {len(selected_servers)} 台服务器...")
-        print(f"{'='*60}")
-
-        success_list, failed_list = [], []
-        start_time = time.time()
-
-        with ThreadPoolExecutor(max_workers=min(10, len(selected_servers))) as executor:
-            futures = {executor.submit(deploy_server, s, password, full_setup): s for s in selected_servers}
-            for future in as_completed(futures):
-                try:
-                    success, srv, error = future.result()
-                    (success_list if success else failed_list).append(srv if success else (srv, error))
-                except Exception as e:
-                    s = futures[future]
-                    failed_list.append((s, str(e)))
-                    with print_lock:
-                        print(f"[{s['id']}] ❌ 部署异常: {e}")
-
-        print(f"\n{'='*60}")
-        print(f"部署完成！成功: {len(success_list)}，失败: {len(failed_list)} (耗时 {time.time() - start_time:.1f}s)")
-        print(f"{'='*60}")
-        if failed_list:
-            print(f"\n❌ 失败的服务器:")
-            for s, error in failed_list:
-                print(f"   {s['id']}. {s['ip']} - {error}")
-        return
-
-    # 操作 1-6 需要选择策略
-    strategy = select_strategy()
-    if not strategy:
-        print("❌ 无效的策略选择")
-        sys.exit(1)
-
-    mode, name, desc = strategy
-    password = get_password()
-
-    display_mode = None
-    if action == "5":
-        print("\n选择显示模式：")
-        print("  1. 美观格式（分组显示）")
-        print("  2. 原始 YAML")
-        mode_choice = input("请选择 (1/2，默认1): ").strip()
-        display_mode = 'raw' if mode_choice == '2' else 'formatted'
-
-    action_map = {
-        "1": start_strategy,
-        "2": stop_strategy,
-        "3": view_status,
-        "4": view_logs,
-        "5": view_config,
-        "6": update_config,
-    }
-
-    handler = action_map[action]
-    for server in selected_servers:
-        if action == "5":
-            handler(server, mode, name, desc, password, display_mode)
-        else:
-            handler(server, mode, name, desc, password)
-
-    print(f"\n{'='*60}")
-    print("操作完成！")
-    print(f"{'='*60}")
+    if choice == "7":
+        sync_main(selected)
+    elif choice == "8":
+        deploy_main(selected)
+    elif choice == "9":
+        query_balance_main(selected)
+    elif choice == "10":
+        buybnb_main(selected)
+    else:
+        per_strategy_main(choice, selected)
 
 
 if __name__ == "__main__":

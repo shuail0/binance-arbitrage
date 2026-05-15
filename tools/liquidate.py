@@ -1,131 +1,102 @@
 #!/usr/bin/env python3
-"""批量清仓工具：查询余额 → 撤单 → 市价卖出（币安现货）"""
-import sys
+# -*- coding: utf-8 -*-
+"""批量清仓工具: 撤单 → 市价卖出 (币安现货, 本机直连 API)"""
+import argparse
 import json
+import sys
+from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
-from datetime import datetime
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from strategies.common.sdk_clients import load_credentials, make_spot_client
 
+QUOTE_CCYS = ("USDT", "USDC", "FDUSD", "TUSD", "BUSD", "BTC", "ETH", "BNB")
 
-class Liquidator:
-    def __init__(self, symbol: str):
-        self.symbol = symbol.upper().replace('-', '')
-        self.base_ccy = self._parse_base(self.symbol)
 
-        creds = load_credentials()
-        self.demo = creds.demo
-        self.client = make_spot_client(creds, with_ws_api=False, with_ws_streams=False)
+def parse_base(symbol: str) -> str:
+    for q in QUOTE_CCYS:
+        if symbol.endswith(q) and len(symbol) > len(q):
+            return symbol[:-len(q)]
+    return symbol[:3]
 
-        self.step_size = Decimal('0')
-        self.min_qty = Decimal('0')
 
-    def _parse_base(self, symbol: str) -> str:
-        for quote in ("USDT", "USDC", "BUSD", "BTC", "ETH", "BNB"):
-            if symbol.endswith(quote) and len(symbol) > len(quote):
-                return symbol[:-len(quote)]
-        return symbol[:3]
+def run(symbol: str):
+    from binance_sdk_spot.rest_api.models import LotSizeFilter
 
-    def _load_exchange_info(self):
-        data = self.client.rest_api.exchange_info(symbol=self.symbol).data()
-        sym = next((s for s in data.symbols if s.symbol == self.symbol), None)
-        if not sym:
-            raise ValueError(f"交易对 {self.symbol} 不存在")
-        for f in sym.filters:
-            ft = getattr(f, "filter_type", None) or getattr(f, "filterType", None)
-            if ft == "LOT_SIZE":
-                self.step_size = Decimal(str(getattr(f, "step_size", None) or getattr(f, "stepSize", "0")))
-                self.min_qty = Decimal(str(getattr(f, "min_qty", None) or getattr(f, "minQty", "0")))
+    symbol = symbol.upper().replace("-", "")
+    base = parse_base(symbol)
+    creds = load_credentials()
+    client = make_spot_client(creds, with_ws_api=False, with_ws_streams=False)
 
-    def _get_balance(self) -> Decimal:
-        data = self.client.rest_api.get_account().data()
-        for b in getattr(data, "balances", []):
-            if getattr(b, "asset", None) == self.base_ccy:
-                return Decimal(str(getattr(b, "free", "0") or "0"))
-        return Decimal('0')
+    sep = "=" * 60
+    print(f"\n{sep}\n  清仓工具 - {symbol} {'(模拟盘)' if creds.demo else '(实盘)'}\n{sep}\n")
 
-    def _cancel_open_orders(self) -> int:
-        try:
-            data = self.client.rest_api.cancel_all_open_orders_on_a_symbol(symbol=self.symbol).data()
-            return len(data) if isinstance(data, list) else 1
-        except Exception:
-            return 0
+    # 1. 交易规则
+    print(f"[1/4] 获取交易规则 {symbol}...")
+    data = client.rest_api.exchange_info(symbol=symbol).data()
+    sym = next((s for s in data.symbols if s.symbol == symbol), None)
+    if not sym:
+        raise ValueError(f"交易对 {symbol} 不存在")
+    step = min_qty = Decimal("0")
+    for w in sym.filters:
+        f = w.actual_instance
+        if isinstance(f, LotSizeFilter):
+            step = Decimal(f.step_size)
+            min_qty = Decimal(f.min_qty)
+            break
+    if step <= 0:
+        raise RuntimeError(f"{symbol} 缺 LOT_SIZE filter")
+    print(f"      step={step}  min_qty={min_qty}")
 
-    def _adjust_qty(self, qty: Decimal) -> Decimal:
-        if self.step_size > 0:
-            qty = (qty // self.step_size) * self.step_size
-        return qty.quantize(self.step_size, rounding=ROUND_DOWN)
+    # 2. 撤单
+    print(f"\n[2/4] 撤所有 {symbol} 挂单...")
+    try:
+        canceled = client.rest_api.cancel_all_open_orders_on_a_symbol(symbol=symbol).data()
+        n = len(canceled) if isinstance(canceled, list) else 1
+    except Exception:
+        n = 0
+    print(f"      撤 {n} 笔")
 
-    def _market_sell(self, qty: Decimal):
-        return self.client.rest_api.new_order(
-            symbol=self.symbol, side="SELL", type="MARKET", quantity=float(qty)
-        ).data()
+    # 3. 余额
+    print(f"\n[3/4] 查询 {base} 可用余额...")
+    bal_data = client.rest_api.get_account().data()
+    balance = next((Decimal(str(b.free)) for b in bal_data.balances if b.asset == base), Decimal("0"))
+    print(f"      余额: {balance} {base}")
 
-    def run(self):
-        print(f"\n{'='*60}")
-        print(f"  清仓工具 - {self.symbol} {'(模拟盘)' if self.demo else '(实盘)'}")
-        print(f"{'='*60}\n")
+    # 4. 市价卖出
+    qty = (balance / step).quantize(Decimal("1"), rounding=ROUND_DOWN) * step
+    if qty < min_qty:
+        print(f"\n[4/4] 可卖 {qty} < min_qty {min_qty}, 跳过")
+        print(f"\n{sep}\n  清仓完成 (无需卖出)\n{sep}\n")
+        return
 
-        print(f"[1/4] 获取交易对 {self.symbol} 信息...")
-        self._load_exchange_info()
-        print(f"      stepSize={self.step_size}, minQty={self.min_qty}")
+    print(f"\n[4/4] 市价卖出 {qty} {base}...")
+    result = client.rest_api.new_order(
+        symbol=symbol, side="SELL", type="MARKET", quantity=str(qty),
+    ).data()
+    order_id = result.order_id
+    print(f"      orderId={order_id} status={result.status}")
+    print(f"      成交: {result.executed_qty} {base} = {result.cummulative_quote_qty} USDT")
 
-        print(f"\n[2/4] 撤销 {self.symbol} 所有挂单...")
-        cancelled = self._cancel_open_orders()
-        print(f"      已撤销 {cancelled} 笔挂单")
-
-        print(f"\n[3/4] 查询 {self.base_ccy} 可用余额...")
-        balance = self._get_balance()
-        print(f"      可用余额: {balance} {self.base_ccy}")
-
-        adjusted = self._adjust_qty(balance)
-        if adjusted < self.min_qty:
-            print(f"\n[4/4] 可卖数量 {adjusted} 小于最小交易量 {self.min_qty}，跳过卖出")
-            print(f"\n{'='*60}\n  清仓完成（无需卖出）\n{'='*60}\n")
-            return
-
-        print(f"\n[4/4] 市价卖出 {adjusted} {self.base_ccy}...")
-        result = self._market_sell(adjusted)
-
-        order_id = getattr(result, "order_id", None) or getattr(result, "orderId", None)
-        if order_id:
-            fill_qty = getattr(result, "executed_qty", None) or getattr(result, "executedQty", "0")
-            fill_quote = getattr(result, "cummulative_quote_qty", None) or getattr(result, "cummulativeQuoteQty", "0")
-            status = getattr(result, "status", "")
-            print(f"      订单已提交: orderId={order_id}, status={status}")
-            print(f"      成交数量: {fill_qty} {self.base_ccy}")
-            print(f"      成交金额: {fill_quote} USDT")
-
-            Path("data").mkdir(exist_ok=True)
-            filename = f"data/liquidate_{self.symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            try:
-                result_dict = result.model_dump()
-            except Exception:
-                result_dict = {"orderId": str(order_id)}
-            Path(filename).write_text(json.dumps(result_dict, ensure_ascii=False, indent=2))
-            print(f"      记录已保存: {filename}")
-        else:
-            print(f"      下单失败: {result}")
-
-        print(f"\n{'='*60}\n  清仓完成\n{'='*60}\n")
+    # 落盘记录
+    Path("data").mkdir(exist_ok=True)
+    fp = Path(f"data/liquidate_{symbol}_{datetime.now():%Y%m%d_%H%M%S}.json")
+    fp.write_text(json.dumps(result.model_dump(), ensure_ascii=False, indent=2))
+    print(f"      记录: {fp}")
+    print(f"\n{sep}\n  清仓完成\n{sep}\n")
 
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="币安现货清仓工具")
-    parser.add_argument("symbol", nargs="?", help="交易对（如 XAUTUSDT）")
-    args = parser.parse_args()
-
+    p = argparse.ArgumentParser(description="币安现货清仓工具")
+    p.add_argument("symbol", nargs="?", help="交易对 (如 XAUTUSDT)")
+    args = p.parse_args()
     symbol = args.symbol or input("交易对 (如 XAUTUSDT): ").strip()
     if not symbol:
         print("未输入交易对")
         sys.exit(1)
-
     try:
-        Liquidator(symbol).run()
+        run(symbol)
     except Exception as e:
         print(f"错误: {e}")
         sys.exit(1)
